@@ -1,0 +1,2885 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Root>
+	<commit hash="2604b140c46d71fb0ffd155ce06f0a6a64c5a19d" author="USUDA Hisashi">
+		<msg>Add axis and adjust the direction.</msg>
+		<modified_files>
+			<file old_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" new_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" added_lines="131" deleted_lines="0">
+				<diff>@@ -1,5 +1,6 @@
+ #include &lt;float.h&gt;
+ #include &lt;geometry_msgs/Point.h&gt;
++#include &lt;visualization_msgs/MarkerArray.h&gt;
+ #include &lt;jsk_recognition_msgs/BoundingBox.h&gt;
+ #include &lt;jsk_recognition_msgs/BoundingBoxArray.h&gt;
+ #include "autoware_msgs/obj_label.h"
+@@ -11,6 +12,12 @@
+ #include &lt;std_msgs/Time.h&gt;
+ #include &lt;tf/tf.h&gt;
+ #include &lt;tf/transform_listener.h&gt;
++#include &lt;vector_map/vector_map.h&gt;
++#include &lt;vector_map_server/GetLane.h&gt;
++
++using vector_map::Node;
++using vector_map::Point;
++using vector_map::Key;
+ 
+ /* flag for comfirming whether multiple topics are received */
+ static bool isReady_obj_label;
+@@ -24,6 +31,7 @@ static constexpr double LOOP_RATE = 15.0;
+ ros::Publisher obj_pose_pub;
+ ros::Publisher obj_pose_timestamp_pub;
+ ros::Publisher cluster_class_pub;
++ros::Publisher marker_array_pub;
+ 
+ static std::string object_type;
+ static std::vector&lt;geometry_msgs::Point&gt; centroids;
+@@ -33,6 +41,10 @@ static ros::Time obj_pose_timestamp;
+ static double threshold_min_dist;
+ static tf::StampedTransform transform;
+ 
++static vector_map::VectorMap vmap;
++static ros::ServiceClient vmap_server;
++static double vmap_threshold;
++
+ struct obj_label_t {
+   std::vector&lt;geometry_msgs::Point&gt; reprojected_positions;
+   std::vector&lt;int&gt; obj_id;
+@@ -86,6 +98,8 @@ static void fusion_objects(void) {
+     autoware_msgs::CloudClusterArray cloud_clusters_msg;
+     cloud_clusters_msg.header = header;
+     cluster_class_pub.publish(cloud_clusters_msg);
++    visualization_msgs::MarkerArray marker_array_msg;
++    marker_array_pub.publish(marker_array_msg);
+ 
+     time.data = obj_pose_timestamp;
+     obj_pose_timestamp_pub.publish(time);
+@@ -124,6 +138,18 @@ static void fusion_objects(void) {
+   autoware_msgs::CloudClusterArray cloud_clusters_msg;
+   cloud_clusters_msg.header = header;
+ 
++  tf::StampedTransform tform;
++  tf::TransformListener listener;
++  try {
++    ros::Time now = ros::Time(0);
++    listener.waitForTransform("/map", "/velodyne", now, ros::Duration(10));
++    listener.lookupTransform("/map", "/velodyne", now, tform);
++  } catch (tf::TransformException ex) {
++    ROS_INFO("%s: %s", __FUNCTION__, ex.what());
++  }
++  visualization_msgs::MarkerArray marker_array_msg;
++  int id = 0;
++
+   for (unsigned int i = 0; i &lt; obj_label_current.obj_id.size(); ++i) {
+     jsk_recognition_msgs::BoundingBox bounding_box;
+     if (obj_indices.at(i) == -1)
+@@ -145,7 +171,104 @@ static void fusion_objects(void) {
+     pub_msg.boxes.push_back(bounding_box);
+     cloud_clusters_msg.clusters.push_back(
+         v_cloud_cluster_current.at(obj_indices.at(i)));
++
++    tf::Quaternion q1(bounding_box.pose.orientation.x, bounding_box.pose.orientation.y, bounding_box.pose.orientation.z, bounding_box.pose.orientation.w);
++    vector_map_server::GetLane get_lane;
++    get_lane.request.pose.pose = bounding_box.pose;
++    tf::Vector3 orgpt(bounding_box.pose.position.x, bounding_box.pose.position.y, bounding_box.pose.position.z);
++    tf::Vector3 convpt = tform * orgpt;
++    get_lane.request.pose.pose.position.x = convpt.x();
++    get_lane.request.pose.pose.position.y = convpt.y();
++    get_lane.request.pose.pose.position.z = convpt.z();
++    ROS_INFO("pos x=%f y=%f z=%f", get_lane.request.pose.pose.position.x, get_lane.request.pose.pose.position.y, get_lane.request.pose.pose.position.z);
++    //get_lane.request.waypoints.waypoints.clear();
++    if (vmap_server.call(get_lane)) {
++      for (const auto&amp; lane : get_lane.response.objects.data) {
++        Node bn = vmap.findByKey(Key&lt;Node&gt;(lane.bnid));
++        Point bp = vmap.findByKey(Key&lt;Point&gt;(bn.pid));
++        Node fn = vmap.findByKey(Key&lt;Node&gt;(lane.fnid));
++        Point fp = vmap.findByKey(Key&lt;Point&gt;(fn.pid));
++        ROS_INFO(" lane bn=(%f,%f) fn=(%f,%f)", bp.ly, bp.bx, fp.ly, fp.bx);
++        double mx = get_lane.request.pose.pose.position.x;
++        double my = get_lane.request.pose.pose.position.y;
++        if ((mx - fp.ly)*(mx - fp.ly) + (my - fp.bx)*(my - fp.bx) &lt; vmap_threshold) {
++          tf::Quaternion ql;
++          ql.setRPY(0, 0, atan2(fp.bx - bp.bx, fp.ly - bp.ly)); // y,x
++          tf::Quaternion qb = tform * q1;
++          tf::Quaternion qm;
++          qm.setRPY(0, 0, M_PI/2);
++          double mr = M_PI;
++          int mi = 0;
++          for (int i = 0; i &lt; 4; i++) { // 0,90,180,270-degree
++            double r = ql.angle(qb);
++            r = (r &gt;= M_PI/2) ? (r - M_PI):r;
++            if (fabs(r) &lt; mr) {
++              mr = fabs(r);
++              mi = i;
++            }
++            qb *= qm;
++          }
++          if (mi &gt; 0) {
++            qm.setRPY(0, 0, M_PI*mi/2);
++            q1 *= qm;
++          }
++          double roll, pitch, yaw;
++          tf::Matrix3x3(q1).getRPY(roll, pitch, yaw);
++          ROS_INFO(" %d roll=%f pitch=%f yaw=%f", mi*90, roll, pitch, yaw);
++        }
++      }
++    } else {
++      ROS_INFO("%s: VectorMap Server call failed.", __FUNCTION__);
++    }
++
++    // x-axis
++    visualization_msgs::Marker marker;
++    marker.header = header;
++    marker.id = id++;
++    marker.lifetime = ros::Duration(0.1);
++    marker.type = visualization_msgs::Marker::ARROW;
++    marker.pose.position = bounding_box.pose.position;
++    marker.pose.orientation.x = q1.x();
++    marker.pose.orientation.y = q1.y();
++    marker.pose.orientation.z = q1.z();
++    marker.pose.orientation.w = q1.w();
++    marker.scale.x = 2.0;
++    marker.scale.y = 0.2;
++    marker.scale.z = 0.1;
++    marker.color.r = 1.0;
++    marker.color.a = 1.0;
++    marker_array_msg.markers.push_back(marker);
++
++    // y-axis
++    tf::Quaternion q2;
++    q2.setRPY(0, 0, M_PI/2);
++    q1 *= q2;
++    marker.id = id++;
++    marker.pose.orientation.x = q1.x();
++    marker.pose.orientation.y = q1.y();
++    marker.pose.orientation.z = q1.z();
++    marker.pose.orientation.w = q1.w();
++    marker.color.r = 0.0;
++    marker.color.g = 1.0;
++    marker.color.a = 1.0;
++    marker_array_msg.markers.push_back(marker);
++
++    // z-axis
++    tf::Quaternion q3;
++    q3.setRPY(0, -M_PI/2, 0);
++    q1 *= q3;
++    marker.id = id++;
++    marker.pose.orientation.x = q1.x();
++    marker.pose.orientation.y = q1.y();
++    marker.pose.orientation.z = q1.z();
++    marker.pose.orientation.w = q1.w();
++    marker.color.g = 0.0;
++    marker.color.b = 1.0;
++    marker.color.a = 1.0;
++    marker_array_msg.markers.push_back(marker);
+   }
++  marker_array_pub.publish(marker_array_msg);
++  //marker_array_msg.markers.clear();
+ 
+   obj_pose_pub.publish(pub_msg);
+   cluster_class_pub.publish(cloud_clusters_msg);
+@@ -258,6 +381,9 @@ int main(int argc, char *argv[]) {
+   isReady_obj_label = false;
+   isReady_cluster_centroids = false;
+ 
++  private_n.param("vmap_threshold", vmap_threshold, 5.0);
++  vmap_threshold *= vmap_threshold;
++
+   ros::Subscriber obj_label_sub =
+       n.subscribe("obj_label", SUBSCRIBE_QUEUE_SIZE, obj_label_cb);
+   ros::Subscriber cluster_centroids_sub = n.subscribe(
+@@ -268,6 +394,11 @@ int main(int argc, char *argv[]) {
+       "/cloud_clusters_class", ADVERTISE_QUEUE_SIZE);
+   obj_pose_timestamp_pub =
+       n.advertise&lt;std_msgs::Time&gt;("obj_pose_timestamp", ADVERTISE_QUEUE_SIZE);
++  marker_array_pub = n.advertise&lt;visualization_msgs::MarkerArray&gt;("obj_pose_arrow", 1, true);
++  vmap_server = n.serviceClient&lt;vector_map_server::GetLane&gt;("/vector_map_server/get_lane");
++  vmap.subscribe(n, vector_map::Category::POINT | vector_map::Category::NODE,
++                 ros::Duration(0)); // non-blocking
++
+   ros::spin();
+ 
+   return 0;
+</diff>
+			</file>
+			<file old_path="ros\src\data\packages\vector_map\lib\vector_map\vector_map.cpp" new_path="ros\src\data\packages\vector_map\lib\vector_map\vector_map.cpp" added_lines="32" deleted_lines="32">
+				<diff>@@ -557,162 +557,162 @@ void VectorMap::registerSubscriber(ros::NodeHandle&amp; nh, category_t category)
+ {
+   if (category &amp; POINT)
+   {
+-    point_.registerSubscriber(nh, "vector_map_info/point");
++    point_.registerSubscriber(nh, "/vector_map_info/point");
+     point_.registerUpdater(updatePoint);
+   }
+   if (category &amp; VECTOR)
+   {
+-    vector_.registerSubscriber(nh, "vector_map_info/vector");
++    vector_.registerSubscriber(nh, "/vector_map_info/vector");
+     vector_.registerUpdater(updateVector);
+   }
+   if (category &amp; LINE)
+   {
+-    line_.registerSubscriber(nh, "vector_map_info/line");
++    line_.registerSubscriber(nh, "/vector_map_info/line");
+     line_.registerUpdater(updateLine);
+   }
+   if (category &amp; AREA)
+   {
+-    area_.registerSubscriber(nh, "vector_map_info/area");
++    area_.registerSubscriber(nh, "/vector_map_info/area");
+     area_.registerUpdater(updateArea);
+   }
+   if (category &amp; POLE)
+   {
+-    pole_.registerSubscriber(nh, "vector_map_info/pole");
++    pole_.registerSubscriber(nh, "/vector_map_info/pole");
+     pole_.registerUpdater(updatePole);
+   }
+   if (category &amp; BOX)
+   {
+-    box_.registerSubscriber(nh, "vector_map_info/box");
++    box_.registerSubscriber(nh, "/vector_map_info/box");
+     box_.registerUpdater(updateBox);
+   }
+   if (category &amp; DTLANE)
+   {
+-    dtlane_.registerSubscriber(nh, "vector_map_info/dtlane");
++    dtlane_.registerSubscriber(nh, "/vector_map_info/dtlane");
+     dtlane_.registerUpdater(updateDTLane);
+   }
+   if (category &amp; NODE)
+   {
+-    node_.registerSubscriber(nh, "vector_map_info/node");
++    node_.registerSubscriber(nh, "/vector_map_info/node");
+     node_.registerUpdater(updateNode);
+   }
+   if (category &amp; LANE)
+   {
+-    lane_.registerSubscriber(nh, "vector_map_info/lane");
++    lane_.registerSubscriber(nh, "/vector_map_info/lane");
+     lane_.registerUpdater(updateLane);
+   }
+   if (category &amp; WAY_AREA)
+   {
+-    way_area_.registerSubscriber(nh, "vector_map_info/way_area");
++    way_area_.registerSubscriber(nh, "/vector_map_info/way_area");
+     way_area_.registerUpdater(updateWayArea);
+   }
+   if (category &amp; ROAD_EDGE)
+   {
+-    road_edge_.registerSubscriber(nh, "vector_map_info/road_edge");
++    road_edge_.registerSubscriber(nh, "/vector_map_info/road_edge");
+     road_edge_.registerUpdater(updateRoadEdge);
+   }
+   if (category &amp; GUTTER)
+   {
+-    gutter_.registerSubscriber(nh, "vector_map_info/gutter");
++    gutter_.registerSubscriber(nh, "/vector_map_info/gutter");
+     gutter_.registerUpdater(updateGutter);
+   }
+   if (category &amp; CURB)
+   {
+-    curb_.registerSubscriber(nh, "vector_map_info/curb");
++    curb_.registerSubscriber(nh, "/vector_map_info/curb");
+     curb_.registerUpdater(updateCurb);
+   }
+   if (category &amp; WHITE_LINE)
+   {
+-    white_line_.registerSubscriber(nh, "vector_map_info/white_line");
++    white_line_.registerSubscriber(nh, "/vector_map_info/white_line");
+     white_line_.registerUpdater(updateWhiteLine);
+   }
+   if (category &amp; STOP_LINE)
+   {
+-    stop_line_.registerSubscriber(nh, "vector_map_info/stop_line");
++    stop_line_.registerSubscriber(nh, "/vector_map_info/stop_line");
+     stop_line_.registerUpdater(updateStopLine);
+   }
+   if (category &amp; ZEBRA_ZONE)
+   {
+-    zebra_zone_.registerSubscriber(nh, "vector_map_info/zebra_zone");
++    zebra_zone_.registerSubscriber(nh, "/vector_map_info/zebra_zone");
+     zebra_zone_.registerUpdater(updateZebraZone);
+   }
+   if (category &amp; CROSS_WALK)
+   {
+-    cross_walk_.registerSubscriber(nh, "vector_map_info/cross_walk");
++    cross_walk_.registerSubscriber(nh, "/vector_map_info/cross_walk");
+     cross_walk_.registerUpdater(updateCrossWalk);
+   }
+   if (category &amp; ROAD_MARK)
+   {
+-    road_mark_.registerSubscriber(nh, "vector_map_info/road_mark");
++    road_mark_.registerSubscriber(nh, "/vector_map_info/road_mark");
+     road_mark_.registerUpdater(updateRoadMark);
+   }
+   if (category &amp; ROAD_POLE)
+   {
+-    road_pole_.registerSubscriber(nh, "vector_map_info/road_pole");
++    road_pole_.registerSubscriber(nh, "/vector_map_info/road_pole");
+     road_pole_.registerUpdater(updateRoadPole);
+   }
+   if (category &amp; ROAD_SIGN)
+   {
+-    road_sign_.registerSubscriber(nh, "vector_map_info/road_sign");
++    road_sign_.registerSubscriber(nh, "/vector_map_info/road_sign");
+     road_sign_.registerUpdater(updateRoadSign);
+   }
+   if (category &amp; SIGNAL)
+   {
+-    signal_.registerSubscriber(nh, "vector_map_info/signal");
++    signal_.registerSubscriber(nh, "/vector_map_info/signal");
+     signal_.registerUpdater(updateSignal);
+   }
+   if (category &amp; STREET_LIGHT)
+   {
+-    street_light_.registerSubscriber(nh, "vector_map_info/street_light");
++    street_light_.registerSubscriber(nh, "/vector_map_info/street_light");
+     street_light_.registerUpdater(updateStreetLight);
+   }
+   if (category &amp; UTILITY_POLE)
+   {
+-    utility_pole_.registerSubscriber(nh, "vector_map_info/utility_pole");
++    utility_pole_.registerSubscriber(nh, "/vector_map_info/utility_pole");
+     utility_pole_.registerUpdater(updateUtilityPole);
+   }
+   if (category &amp; GUARD_RAIL)
+   {
+-    guard_rail_.registerSubscriber(nh, "vector_map_info/guard_rail");
++    guard_rail_.registerSubscriber(nh, "/vector_map_info/guard_rail");
+     guard_rail_.registerUpdater(updateGuardRail);
+   }
+   if (category &amp; SIDE_WALK)
+   {
+-    side_walk_.registerSubscriber(nh, "vector_map_info/side_walk");
++    side_walk_.registerSubscriber(nh, "/vector_map_info/side_walk");
+     side_walk_.registerUpdater(updateSideWalk);
+   }
+   if (category &amp; DRIVE_ON_PORTION)
+   {
+-    drive_on_portion_.registerSubscriber(nh, "vector_map_info/drive_on_portion");
++    drive_on_portion_.registerSubscriber(nh, "/vector_map_info/drive_on_portion");
+     drive_on_portion_.registerUpdater(updateDriveOnPortion);
+   }
+   if (category &amp; CROSS_ROAD)
+   {
+-    cross_road_.registerSubscriber(nh, "vector_map_info/cross_road");
++    cross_road_.registerSubscriber(nh, "/vector_map_info/cross_road");
+     cross_road_.registerUpdater(updateCrossRoad);
+   }
+   if (category &amp; SIDE_STRIP)
+   {
+-    side_strip_.registerSubscriber(nh, "vector_map_info/side_strip");
++    side_strip_.registerSubscriber(nh, "/vector_map_info/side_strip");
+     side_strip_.registerUpdater(updateSideStrip);
+   }
+   if (category &amp; CURVE_MIRROR)
+   {
+-    curve_mirror_.registerSubscriber(nh, "vector_map_info/curve_mirror");
++    curve_mirror_.registerSubscriber(nh, "/vector_map_info/curve_mirror");
+     curve_mirror_.registerUpdater(updateCurveMirror);
+   }
+   if (category &amp; WALL)
+   {
+-    wall_.registerSubscriber(nh, "vector_map_info/wall");
++    wall_.registerSubscriber(nh, "/vector_map_info/wall");
+     wall_.registerUpdater(updateWall);
+   }
+   if (category &amp; FENCE)
+   {
+-    fence_.registerSubscriber(nh, "vector_map_info/fence");
++    fence_.registerSubscriber(nh, "/vector_map_info/fence");
+     fence_.registerUpdater(updateFence);
+   }
+   if (category &amp; RAIL_CROSSING)
+   {
+-    rail_crossing_.registerSubscriber(nh, "vector_map_info/rail_crossing");
++    rail_crossing_.registerSubscriber(nh, "/vector_map_info/rail_crossing");
+     rail_crossing_.registerUpdater(updateRailCrossing);
+   }
+ }
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="d51eea44f87f251b94978624c71f32cf1cd71967" author="Abraham Monrroy">
+		<msg>Publishing unique IDs (#740)
+
+Checked against 14.04 and 16.04</msg>
+		<modified_files>
+			<file old_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\kf_lidar_track\KfLidarTracker.cpp" new_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\kf_lidar_track\KfLidarTracker.cpp" added_lines="64" deleted_lines="46">
+				<diff>@@ -32,9 +32,8 @@ void KfLidarTracker::CreatePolygonFromPoints(const geometry_msgs::Polygon&amp; in_po
+ void KfLidarTracker::Update(const autoware_msgs::CloudClusterArray&amp; in_cloud_cluster_array, DistType in_match_method)
+ {
+ 	size_t num_detections = in_cloud_cluster_array.clusters.size();
+-	size_t num_tracks = tracks.size();
+-	std::vector&lt;int&gt; track_assignments(num_tracks, -1);
+-	std::vector&lt; std::vector&lt;size_t&gt; &gt; track_assignments_vector(num_tracks);
++	size_t num_tracks = tracks_.size();
++
+ 	std::vector&lt;size_t&gt; detections_assignments;
+ 	std::vector&lt;double&gt; detections_areas(num_detections, 0.0f);
+ 
+@@ -47,13 +46,17 @@ void KfLidarTracker::Update(const autoware_msgs::CloudClusterArray&amp; in_cloud_clu
+ 		// If no tracks yet
+ 		for (size_t i = 0; i &lt; num_detections; ++i)
+ 		{
+-			tracks.push_back(CTrack(in_cloud_cluster_array.clusters[i],
++			tracks_.push_back(CTrack(in_cloud_cluster_array.clusters[i],
+ 									time_delta_,
+ 									acceleration_noise_magnitude_,
+ 									next_track_id_++)
+ 							);
+ 		}
++		num_tracks = tracks_.size();
+ 	}
++	std::vector&lt;int&gt; track_assignments(num_tracks, -1);
++	std::vector&lt; std::vector&lt;size_t&gt; &gt; track_assignments_vector(num_tracks);
++
+ 	//else
+ 	{
+ 		//std::cout &lt;&lt; "Trying to match " &lt;&lt; num_tracks &lt;&lt; " tracks with " &lt;&lt; num_detections &lt;&lt; std::endl;
+@@ -71,15 +74,15 @@ void KfLidarTracker::Update(const autoware_msgs::CloudClusterArray&amp; in_cloud_clu
+ 
+ 			for (size_t j = 0; j &lt; num_tracks; j++)
+ 			{
+-				//float current_distance = tracks[j].CalculateDistance(cv::Point2f(in_cloud_cluster_array.clusters[i].centroid_point.point.x, in_cloud_cluster_array.clusters[i].centroid_point.point.y));
++				//float current_distance = tracks_[j].CalculateDistance(cv::Point2f(in_cloud_cluster_array.clusters[i].centroid_point.point.x, in_cloud_cluster_array.clusters[i].centroid_point.point.y));
+ 				float current_distance = sqrt(
+-												pow(tracks[j].GetCluster().centroid_point.point.x - in_cloud_cluster_array.clusters[i].centroid_point.point.x, 2) +
+-												pow(tracks[j].GetCluster().centroid_point.point.y - in_cloud_cluster_array.clusters[i].centroid_point.point.y, 2)
++												pow(tracks_[j].GetCluster().centroid_point.point.x - in_cloud_cluster_array.clusters[i].centroid_point.point.x, 2) +
++												pow(tracks_[j].GetCluster().centroid_point.point.y - in_cloud_cluster_array.clusters[i].centroid_point.point.y, 2)
+ 										);
+ 
+ 				//tracker polygon
+ 				boost_polygon hull_track_polygon;
+-				CreatePolygonFromPoints(tracks[j].GetCluster().convex_hull.polygon, hull_track_polygon);
++				CreatePolygonFromPoints(tracks_[j].GetCluster().convex_hull.polygon, hull_track_polygon);
+ 
+ 				//if(current_distance &lt; current_distance_threshold)
+ 				if (!boost::geometry::disjoint(hull_detection_polygon, hull_track_polygon)
+@@ -100,7 +103,7 @@ void KfLidarTracker::Update(const autoware_msgs::CloudClusterArray&amp; in_cloud_clu
+ 			if (track_assignments[i]&gt;=0) //if this track was assigned, update kalman filter, reset remaining life
+ 			{
+ 				//keep oldest
+-				tracks[i].skipped_frames = 0;
++				tracks_[i].skipped_frames = 0;
+ 
+ 				//join all assigned detections to update the tracker
+ 				/*autoware_msgs::CloudClusterPtr summed_cloud_cluster(new autoware_msgs::CloudCluster());
+@@ -121,28 +124,28 @@ void KfLidarTracker::Update(const autoware_msgs::CloudClusterArray&amp; in_cloud_clu
+ 
+ 				merged_cluster-&gt;ToRosMessage(in_cloud_cluster_array.clusters[track_assignments[i]].header, *summed_cloud_cluster);*/
+ 
+-				tracks[i].Update(in_cloud_cluster_array.clusters[track_assignments[i]],//*summed_cloud_cluster,
++				tracks_[i].Update(in_cloud_cluster_array.clusters[track_assignments[i]],//*summed_cloud_cluster,
+ 								true,
+ 								maximum_trace_length_);
+ 				//detections_assignments.push_back(track_assignments[i]);
+ 			}
+ 			else				     // if not matched continue using predictions, and increase life
+ 			{
+-				tracks[i].Update(autoware_msgs::CloudCluster(), //empty cluster
++				tracks_[i].Update(autoware_msgs::CloudCluster(), //empty cluster
+ 									false, //not matched,
+ 									maximum_trace_length_
+ 								);
+-				tracks[i].skipped_frames++;
++				tracks_[i].skipped_frames++;
+ 			}
+-			tracks[i].life_span++;
++			tracks_[i].life_span++;
+ 		}
+ 
+ 		// If track life is long, remove it.
+-		for (size_t i = 0; i &lt; tracks.size(); i++)
++		for (size_t i = 0; i &lt; tracks_.size(); i++)
+ 		{
+-			if (tracks[i].skipped_frames &gt; maximum_allowed_skipped_frames_)
++			if (tracks_[i].skipped_frames &gt; maximum_allowed_skipped_frames_)
+ 			{
+-				tracks.erase(tracks.begin() + i);
++				tracks_.erase(tracks_.begin() + i);
+ 				i--;
+ 			}
+ 		}
+@@ -154,7 +157,7 @@ void KfLidarTracker::Update(const autoware_msgs::CloudClusterArray&amp; in_cloud_clu
+ 			std::vector&lt;size_t&gt;::iterator it = find(detections_assignments.begin(), detections_assignments.end(), i);
+ 			if (it == detections_assignments.end())//if detection not found in the already assigned ones, add new tracker
+ 			{
+-				tracks.push_back(CTrack(in_cloud_cluster_array.clusters[i],
++				tracks_.push_back(CTrack(in_cloud_cluster_array.clusters[i],
+ 										time_delta_,
+ 										acceleration_noise_magnitude_,
+ 										next_track_id_++)
+@@ -167,9 +170,18 @@ void KfLidarTracker::Update(const autoware_msgs::CloudClusterArray&amp; in_cloud_clu
+ 		//std::cout &lt;&lt; "Trackers added: " &lt;&lt; una &lt;&lt; std::endl;
+ 
+ 		//finally check trackers among them
++		for(size_t i=0; i&lt; tracks_.size(); i++)
++			std::cout &lt;&lt; tracks_[i].track_id &lt;&lt; ",";
++		std::cout &lt;&lt; std::endl &lt;&lt; "Check" &lt;&lt; std::endl;
+ 		CheckAllTrackersForMerge(final_tracks);
+ 
+-		tracks = final_tracks;
++		tracks_ = final_tracks;
++
++		for(size_t i=0; i&lt; tracks_.size(); i++)
++			std::cout &lt;&lt; tracks_[i].track_id &lt;&lt; ",";
++		std::cout &lt;&lt; std::endl;
++
++		//std::cout &lt;&lt; "Final Trackers " &lt;&lt; tracks_.size() &lt;&lt; std::endl;
+ 	}//endof matching
+ 
+ }
+@@ -221,36 +233,42 @@ void KfLidarTracker::MergeTrackers(std::vector&lt;CTrack&gt;&amp; in_trackers, std::vector
+ 		}
+ 		in_out_merged_trackers[in_merge_indices[i]] = true;
+ 	}
+-
+-	out_trackers.push_back(in_trackers[oldest_index]);
++	bool found=false;
++	for(size_t i=0; i&lt; out_trackers.size(); i++){
++		found = out_trackers[i].track_id == in_trackers[oldest_index].track_id;
++	}
++	if (!found)
++	{
++		out_trackers.push_back(in_trackers[oldest_index]);
++		in_out_merged_trackers[oldest_index] = true;
++	}
+ 	//out_trackers.back().cluster = in_trackers[largest_index].GetCluster();
+ }
+ 
+ void KfLidarTracker::CheckAllTrackersForMerge(std::vector&lt;CTrack&gt;&amp; out_trackers)
+ {
+ 	//std::cout &lt;&lt; "checkAllForMerge" &lt;&lt; std::endl;
+-	std::vector&lt;bool&gt; visited_trackers(tracks.size(), false);
+-	std::vector&lt;bool&gt; merged_trackers(tracks.size(), false);
++	std::vector&lt;bool&gt; visited_trackers(tracks_.size(), false);
++	std::vector&lt;bool&gt; merged_trackers(tracks_.size(), false);
+ 	size_t current_index=0;
+-	for (size_t i = 0; i&lt; tracks.size(); i++)
++	for (size_t i = 0; i&lt; tracks_.size(); i++)
+ 	{
+ 		if (!visited_trackers[i])
+ 		{
+ 			visited_trackers[i] = true;
+ 			std::vector&lt;size_t&gt; merge_indices;
+-			CheckTrackerMerge(i, tracks, visited_trackers, merge_indices, tracker_merging_threshold_);
+-			MergeTrackers(tracks, out_trackers, merge_indices, current_index++, merged_trackers);
++			CheckTrackerMerge(i, tracks_, visited_trackers, merge_indices, tracker_merging_threshold_);
++			MergeTrackers(tracks_, out_trackers, merge_indices, current_index++, merged_trackers);
+ 		}
+ 	}
+-	for(size_t i =0; i&lt; tracks.size(); i++)
++	for(size_t i =0; i&lt; tracks_.size(); i++)
+ 	{
+ 		//check for clusters not merged, add them to the output
+ 		if (!merged_trackers[i])
+ 		{
+-			out_trackers.push_back(tracks[i]);
++			out_trackers.push_back(tracks_[i]);
+ 		}
+ 	}
+-
+ 	//ClusterPtr cluster(new Cluster());
+ }
+ // ---------------------------------------------------------------------------
+@@ -265,13 +283,13 @@ void KfLidarTracker::CheckAllTrackersForMerge(std::vector&lt;CTrack&gt;&amp; out_trackers)
+ 	// -----------------------------------
+ 	// If there is no tracks yet, then every cv::Point begins its own track.
+ 	// -----------------------------------
+-	if (tracks.size() == 0)
++	if (tracks_.size() == 0)
+ 	{
+ 		std::cout &lt;&lt; "New track" &lt;&lt; std::endl;
+ 		// If no tracks yet
+ 		for (size_t i = 0; i &lt; detections_num; ++i)
+ 		{
+-			tracks.push_back(CTrack(in_cloud_cluster_array.clusters[i],
++			tracks_.push_back(CTrack(in_cloud_cluster_array.clusters[i],
+ 									time_delta_,
+ 									acceleration_noise_magnitude_,
+ 									next_track_id_++)
+@@ -279,12 +297,12 @@ void KfLidarTracker::CheckAllTrackersForMerge(std::vector&lt;CTrack&gt;&amp; out_trackers)
+ 		}
+ 	}
+ 
+-	size_t N = tracks.size();
++	size_t N = tracks_.size();
+ 	size_t M = detections_num;
+ 
+ 	std::vector&lt;int&gt; assignment;
+ 
+-	if (!tracks.empty())
++	if (!tracks_.empty())
+ 	{
+ 		std::cout &lt;&lt; "Try to match" &lt;&lt; std::endl;
+ 		std::vector&lt;float&gt; cost_matrix(N * M);
+@@ -292,21 +310,21 @@ void KfLidarTracker::CheckAllTrackersForMerge(std::vector&lt;CTrack&gt;&amp; out_trackers)
+ 		switch (distType)
+ 		{
+ 		case CentersDist:
+-			for (size_t i = 0; i &lt; tracks.size(); i++)
++			for (size_t i = 0; i &lt; tracks_.size(); i++)
+ 			{
+ 				for (size_t j = 0; j &lt; detections_num; j++)
+ 				{
+-					cost_matrix[i + j * N] = tracks[i].CalculateDistance(cv::Point2f(in_cloud_cluster_array.clusters[j].centroid_point.point.x, in_cloud_cluster_array.clusters[j].centroid_point.point.y));
++					cost_matrix[i + j * N] = tracks_[i].CalculateDistance(cv::Point2f(in_cloud_cluster_array.clusters[j].centroid_point.point.x, in_cloud_cluster_array.clusters[j].centroid_point.point.y));
+ 				}
+ 			}
+ 			break;
+ 
+ 		case RectsDist:
+-			for (size_t i = 0; i &lt; tracks.size(); i++)
++			for (size_t i = 0; i &lt; tracks_.size(); i++)
+ 			{
+ 				for (size_t j = 0; j &lt; detections_num; j++)
+ 				{
+-					cost_matrix[i + j * N] = tracks[i].CalculateDistance( cv::Rect_&lt;float&gt;(in_cloud_cluster_array.clusters[i].centroid_point.point.x - in_cloud_cluster_array.clusters[i].bounding_box.dimensions.x/2,
++					cost_matrix[i + j * N] = tracks_[i].CalculateDistance( cv::Rect_&lt;float&gt;(in_cloud_cluster_array.clusters[i].centroid_point.point.x - in_cloud_cluster_array.clusters[i].bounding_box.dimensions.x/2,
+ 																			in_cloud_cluster_array.clusters[i].centroid_point.point.y - in_cloud_cluster_array.clusters[i].bounding_box.dimensions.y/2,
+ 																			in_cloud_cluster_array.clusters[i].bounding_box.dimensions.x,
+ 																			in_cloud_cluster_array.clusters[i].bounding_box.dimensions.y
+@@ -334,26 +352,26 @@ void KfLidarTracker::CheckAllTrackersForMerge(std::vector&lt;CTrack&gt;&amp; out_trackers)
+ 				if (cost_matrix[i + assignment[i] * N] &gt; distance_threshold_)
+ 				{
+ 					assignment[i] = -1;
+-					tracks[i].skipped_frames = 1;
++					tracks_[i].skipped_frames = 1;
+ 					std::cout &lt;&lt; "Existing track Not matched " &lt;&lt; i &lt;&lt; " Distance:" &lt;&lt; cost_matrix[i + assignment[i] * N] &lt;&lt; std::endl;
+ 				}
+ 			}
+ 			else
+ 			{
+ 				// If track have no assigned detect, then increment skipped frames counter.
+-				tracks[i].skipped_frames++;
+-				std::cout &lt;&lt; "Existing track Not matched " &lt;&lt; i &lt;&lt;", dying " &lt;&lt; tracks[i].skipped_frames &lt;&lt; std::endl;
++				tracks_[i].skipped_frames++;
++				std::cout &lt;&lt; "Existing track Not matched " &lt;&lt; i &lt;&lt;", dying " &lt;&lt; tracks_[i].skipped_frames &lt;&lt; std::endl;
+ 			}
+ 		}
+ 
+ 		// -----------------------------------
+ 		// If track didn't get detects long time, remove it.
+ 		// -----------------------------------
+-		for (size_t i = 0; i &lt; tracks.size(); i++)
++		for (size_t i = 0; i &lt; tracks_.size(); i++)
+ 		{
+-			if (tracks[i].skipped_frames &gt; maximum_allowed_skipped_frames_)
++			if (tracks_[i].skipped_frames &gt; maximum_allowed_skipped_frames_)
+ 			{
+-				tracks.erase(tracks.begin() + i);
++				tracks_.erase(tracks_.begin() + i);
+ 				assignment.erase(assignment.begin() + i);
+ 				std::cout &lt;&lt; "Died " &lt;&lt; i &lt;&lt; std::endl;
+ 				i--;
+@@ -369,7 +387,7 @@ void KfLidarTracker::CheckAllTrackersForMerge(std::vector&lt;CTrack&gt;&amp; out_trackers)
+ 		if (find(assignment.begin(), assignment.end(), i) == assignment.end())
+ 		{
+ 			std::cout &lt;&lt; "New object, Not matched " &lt;&lt; i &lt;&lt; std::endl;
+-			tracks.push_back(CTrack(in_cloud_cluster_array.clusters[i],
++			tracks_.push_back(CTrack(in_cloud_cluster_array.clusters[i],
+ 									time_delta_,
+ 									acceleration_noise_magnitude_,
+ 									next_track_id_++)
+@@ -384,16 +402,16 @@ void KfLidarTracker::CheckAllTrackersForMerge(std::vector&lt;CTrack&gt;&amp; out_trackers)
+ 
+ 		if (assignment[i] != -1) // If we have assigned detect, then update using its coordinates,
+ 		{
+-			tracks[i].skipped_frames = 0;
++			tracks_[i].skipped_frames = 0;
+ 			std::cout &lt;&lt; "Matched. Kalman Update on " &lt;&lt; i &lt;&lt; std::endl;
+-			tracks[i].Update(	in_cloud_cluster_array.clusters[i],
++			tracks_[i].Update(	in_cloud_cluster_array.clusters[i],
+ 								true,
+ 								maximum_trace_length_);
+ 		}
+ 		else				     // if not continue using predictions
+ 		{
+ 			std::cout &lt;&lt; "Not Matched. Kalman Update on " &lt;&lt; i &lt;&lt; std::endl;
+-			tracks[i].Update(autoware_msgs::CloudCluster(), false, maximum_trace_length_);
++			tracks_[i].Update(autoware_msgs::CloudCluster(), false, maximum_trace_length_);
+ 		}
+ 	}
+ 
+</diff>
+			</file>
+			<file old_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\kf_lidar_track\includes\KfLidarTracker.h" new_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\kf_lidar_track\includes\KfLidarTracker.h" added_lines="1" deleted_lines="1">
+				<diff>@@ -118,7 +118,7 @@ public:
+ 		RectsDist = 1
+ 	};
+ 
+-	std::vector&lt; CTrack &gt; tracks;
++	std::vector&lt; CTrack &gt; tracks_;//TODO: add GetTracks getter
+ 	void Update(const autoware_msgs::CloudClusterArray&amp; in_cloud_cluster_array, DistType in_disttype);
+ 
+ 
+</diff>
+			</file>
+			<file old_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\kf_lidar_track\kf_lidar_track.cpp" new_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\kf_lidar_track\kf_lidar_track.cpp" added_lines="11" deleted_lines="11">
+				<diff>@@ -102,25 +102,25 @@ void KfLidarTrackNode::CloudClustersCallback(const autoware_msgs::CloudClusterAr
+ 
+ 	tracked_hulls.header = in_cloud_cluster_array_ptr-&gt;header;
+ 	tracked_boxes.header = in_cloud_cluster_array_ptr-&gt;header;
+-	for (unsigned int i = 0; i &lt; tracker_ptr-&gt;tracks.size(); i++)
++	for (unsigned int i = 0; i &lt; tracker_ptr-&gt;tracks_.size(); i++)
+ 	{
+ 		//BBOXES
+ 		jsk_recognition_msgs::BoundingBox tracked_box;
+-		tracked_box = tracker_ptr-&gt;tracks[i].GetCluster().bounding_box;
++		tracked_box = tracker_ptr-&gt;tracks_[i].GetCluster().bounding_box;
+ 		tracked_box.header = in_cloud_cluster_array_ptr-&gt;header;
+-		tracked_box.label = tracker_ptr-&gt;tracks[i].track_id;
+-		tracked_box.value = tracker_ptr-&gt;tracks[i].track_id;
+-		//tracker_ptr-&gt;tracks[i]-&gt;trace.end();//calculate orientation
++		tracked_box.label = tracker_ptr-&gt;tracks_[i].track_id;
++		tracked_box.value = tracker_ptr-&gt;tracks_[i].track_id;
++		//tracker_ptr-&gt;tracks_[i]-&gt;trace.end();//calculate orientation
+ 		tracked_boxes.boxes.push_back(tracked_box);
+ 		//END BBOXES
+ 
+ 		//CONVEx HULL
+ 		geometry_msgs::PolygonStamped hull;
+-		hull = tracker_ptr-&gt;tracks[i].GetCluster().convex_hull;
++		hull = tracker_ptr-&gt;tracks_[i].GetCluster().convex_hull;
+ 		//std::cout &lt;&lt; "hull size:" &lt;&lt; hull.polygon.points.size() &lt;&lt; std::endl;
+ 		hull.header = in_cloud_cluster_array_ptr-&gt;header;
+ 		tracked_hulls.polygons.push_back(hull);
+-		tracked_hulls.labels.push_back(tracker_ptr-&gt;tracks[i].track_id);
++		tracked_hulls.labels.push_back(tracker_ptr-&gt;tracks_[i].track_id);
+ 
+ 		//END HULLS
+ 
+@@ -129,16 +129,16 @@ void KfLidarTrackNode::CloudClustersCallback(const autoware_msgs::CloudClusterAr
+ 		tracked_pictogram.header = in_cloud_cluster_array_ptr-&gt;header;
+ 
+ 		tracked_pictogram.mode = tracked_pictogram.STRING_MODE;
+-		tracked_pictogram.pose.position.x = tracker_ptr-&gt;tracks[i].GetCluster().max_point.point.x;
+-		tracked_pictogram.pose.position.y = tracker_ptr-&gt;tracks[i].GetCluster().max_point.point.y;
+-		tracked_pictogram.pose.position.z = tracker_ptr-&gt;tracks[i].GetCluster().max_point.point.z;
++		tracked_pictogram.pose.position.x = tracker_ptr-&gt;tracks_[i].GetCluster().max_point.point.x;
++		tracked_pictogram.pose.position.y = tracker_ptr-&gt;tracks_[i].GetCluster().max_point.point.y;
++		tracked_pictogram.pose.position.z = tracker_ptr-&gt;tracks_[i].GetCluster().max_point.point.z;
+ 		tf::Quaternion quat(0.0, -0.7, 0.0, 0.7);
+ 		tf::quaternionTFToMsg(quat, tracked_pictogram.pose.orientation);
+ 		tracked_pictogram.size = 4;
+ 		std_msgs::ColorRGBA color;
+ 		color.a = 1; color.r = 1; color.g = 1; color.b = 1;
+ 		tracked_pictogram.color = color;
+-		tracked_pictogram.character = std::to_string( tracker_ptr-&gt;tracks[i].track_id );
++		tracked_pictogram.character = std::to_string( tracker_ptr-&gt;tracks_[i].track_id );
+ 		tracked_ids.header = in_cloud_cluster_array_ptr-&gt;header;
+ 		tracked_ids.pictograms.push_back(tracked_pictogram);
+ 		//PICTO
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="3425662de7b23ac9955e5569f0f9ef61222d072c" author="Abraham Monrroy">
+		<msg>TierFusion Driver Updated (#742)
+
+Added Support for new firmware version.
+Features:
+-IP Address changed to the same as Velodyne's
+-Automatic Device Initialization "PlugAndPlay"
+
+Host IP Address MUST be set 192.168.1.1
+TierFusion address is fixed to 192.168.1.200
+Velodyne address is considered as default value, 192.168.1.201
+
+Tested in 14.04 and 16.04</msg>
+		<modified_files>
+			<file old_path="ros\src\sensing\drivers\camera\packages\vectacam\nodes\vectacam\VectaCam.cpp" new_path="ros\src\sensing\drivers\camera\packages\vectacam\nodes\vectacam\VectaCam.cpp" added_lines="7" deleted_lines="5">
+				<diff>@@ -1,6 +1,6 @@
+ #include "VectaCam.h"
+ 
+-VectaCam::VectaCam(unsigned int in_configuration_port, unsigned int in_data_port, std::string in_parameter_file)
++VectaCam::VectaCam(std::string in_camera_ip, unsigned int in_configuration_port, unsigned int in_data_port, std::string in_parameter_file)
+ {
+ 	this-&gt;data_port_ 			= in_data_port;
+ 	this-&gt;configuration_port_ 	= in_configuration_port;
+@@ -14,6 +14,7 @@ VectaCam::VectaCam(unsigned int in_configuration_port, unsigned int in_data_port
+ 	this-&gt;image_height_ 		= VECTACAM_IMG_HEIGHT;
+ 	this-&gt;image_buffer_ 		= new char[image_width_ * 3 * image_height_];
+ 	this-&gt;parameter_file_ 		= in_parameter_file;
++	this-&gt;camera_ip_			= in_camera_ip;
+ 	_initialize_camera(configuration_port_, data_port_, parameter_file_);
+ }
+ 
+@@ -61,7 +62,7 @@ void VectaCam::_send_commands_to_camera(unsigned int in_port, std::vector&lt;VectaC
+ 	memset((char *) &amp;socket_address, 0, sizeof(socket_address));
+ 	socket_address.sin_family = AF_INET;
+ 	socket_address.sin_port = htons(in_port);
+-	if (inet_aton("10.0.0.1", &amp;socket_address.sin_addr)==0)
++	if (inet_aton(camera_ip_.c_str(), &amp;socket_address.sin_addr)==0)
+ 	{
+ 		std::cout &lt;&lt; "Invalid IP address" &lt;&lt; std::endl;
+ 		return;
+@@ -121,7 +122,7 @@ void VectaCam::_enable_camera(unsigned int in_port, bool in_enable)
+ 	memset((char *) &amp;socket_address, 0, sizeof(socket_address));
+ 	socket_address.sin_family = AF_INET;
+ 	socket_address.sin_port = htons(in_port);
+-	if (inet_aton(VECTACAM_CAMERA_IP, &amp;socket_address.sin_addr)==0)
++	if (inet_aton(camera_ip_.c_str(), &amp;socket_address.sin_addr)==0)
+ 	{
+ 		std::cout &lt;&lt; "Invalid IP address" &lt;&lt; std::endl;
+ 		return;
+@@ -167,7 +168,6 @@ long int VectaCam::GetFrameNumber()
+ 
+ void VectaCam::StartCamera()
+ {
+-
+ 	int 		socket_descriptor;
+ 	struct 		sockaddr_in socket_address;
+ 	socklen_t length;
+@@ -177,6 +177,7 @@ void VectaCam::StartCamera()
+ 		std::cout &lt;&lt; "Problem creating socket\n";
+ 		return;
+ 	}
++	std::cout &lt;&lt; "Socket Created\n";
+ 
+ 	socket_address.sin_family = AF_INET;
+ 	socket_address.sin_addr.s_addr = htonl(INADDR_ANY);
+@@ -187,6 +188,7 @@ void VectaCam::StartCamera()
+ 		std::cout &lt;&lt; "Problem binding" &lt;&lt; std::endl;
+ 		return;
+ 	}
++	std::cout &lt;&lt; "Binded..." &lt;&lt; std::endl;
+ 
+ 	length = sizeof(socket_address);
+ 	if (getsockname(socket_descriptor, reinterpret_cast&lt;sockaddr *&gt; (&amp;socket_address), &amp;length) &lt; 0)
+@@ -241,6 +243,7 @@ void VectaCam::_udp_receive(int in_socket_descriptor)
+ 		}
+ 		else
+ 		{
++			//std::cout &lt;&lt; "Received data " &lt;&lt; n &lt;&lt; std::endl;
+ 			uint32_t packet_offset = ntohl(*(uint32_t*)(buffer_in + 4));
+ 			uint32_t packet_length = ntohl(*(uint32_t*)(buffer_in + 8));
+ 			uint32_t header = ntohl(*(uint32_t*)(buffer_in + 12));
+@@ -256,7 +259,6 @@ void VectaCam::_udp_receive(int in_socket_descriptor)
+ 			}
+ 			else
+ 			{
+-
+ 				line_number = header - 1;
+ 				_form_image(line_number, buffer_in, packet_offset, packet_length);
+ 			}
+</diff>
+			</file>
+			<file old_path="ros\src\sensing\drivers\camera\packages\vectacam\nodes\vectacam\VectaCam.h" new_path="ros\src\sensing\drivers\camera\packages\vectacam\nodes\vectacam\VectaCam.h" added_lines="2" deleted_lines="1">
+				<diff>@@ -40,7 +40,7 @@ struct VectaCamCommand
+ class VectaCam
+ {
+ public:
+-	VectaCam(unsigned int in_configuration_port, unsigned int in_data_port, std::string in_parameter_file);
++	VectaCam(std::string in_camera_ip, unsigned int in_configuration_port, unsigned int in_data_port, std::string in_parameter_file);
+ 	void 			GetImage(cv::Mat&amp; out_image);
+ 	virtual 		~VectaCam();
+ 	void 			StartCamera();
+@@ -61,6 +61,7 @@ private:
+ 	int				image_width_;
+ 	int				image_height_;
+ 	char			*image_buffer_;
++	std::string		camera_ip_;
+ 	void 			_udp_receive(int in_socket_descriptor);
+ 	void			_initialize_camera(unsigned int in_configuration_port, unsigned int in_data_port, std::string in_parameter_file);
+ 	void			_parse_parameter_file(std::string in_parameter_file, std::vector&lt;VectaCamCommand&gt;&amp; out_commands);
+</diff>
+			</file>
+			<file old_path="ros\src\sensing\drivers\camera\packages\vectacam\nodes\vectacam\vectacam_node.cpp" new_path="ros\src\sensing\drivers\camera\packages\vectacam\nodes\vectacam\vectacam_node.cpp" added_lines="1" deleted_lines="1">
+				<diff>@@ -76,7 +76,7 @@ public:
+ 			publishers_cameras_[i] = node_handle_.advertise&lt;sensor_msgs::Image&gt;(current_topic, 1);
+ 		}
+ 
+-		VectaCam vectacamera(VECTACAM_CONFIG_PORT, VECTACAM_DATA_PORT, config_file_path);
++		VectaCam vectacamera(camera_ip, VECTACAM_CONFIG_PORT, VECTACAM_DATA_PORT, config_file_path);
+ 		std::thread *capture_thread= new std::thread(&amp;VectaCam::StartCamera, &amp;vectacamera);
+ 
+ 		cv::Mat image;
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="bfe9988c6514998fa1baa3cc7e91b15d00f17223" author="AMC">
+		<msg>-Standarized code
+-Added support for the 3 Velodyne Sensors models (use model_sensor {16,32,64})
+-Parametrized</msg>
+		<modified_files>
+			<file old_path="ros\src\sensing\filters\packages\points_preprocessor\nodes\ground_filter\ground_filter.cpp" new_path="ros\src\sensing\filters\packages\points_preprocessor\nodes\ground_filter\ground_filter.cpp" added_lines="208" deleted_lines="180">
+				<diff>@@ -14,9 +14,9 @@
+ 
+ enum Label
+ {
+-        GROUND = 0,
+-        VERTICAL = 1,
+-        UNKNOWN = 3
++	GROUND = 0,
++	VERTICAL = 1,
++	UNKNOWN = 3
+ };
+ 
+ class GroundFilter
+@@ -27,181 +27,199 @@ public:
+ 
+ private:
+ 
+-	ros::NodeHandle n;
+-        ros::Subscriber sub;
+-	ros::Publisher vertical_points_pub;
+-	ros::Publisher ground_points_pub;
+-
+-        std::string     point_topic;
+-	int 		sensor_model;
+-	double 		sensor_height;
+-	double 		max_slope;
+-	int 		min_point;
+-	double 		clipping_thres;
+-	double 		gap_thres;
+-	double 		point_distance;
+-        bool            floor_removal;
+-
+-	int 		vertical_res;
+-	int 		horizontal_res;
+-	double 		limiting_ratio;
+-	cv::Mat 	index_map;
+-	Label 		class_label[64];
+-
+-	boost::chrono::high_resolution_clock::time_point t1;
+-	boost::chrono::high_resolution_clock::time_point t2;
+-	boost::chrono::nanoseconds elap_time;
+-
+-	void initLabelArray(int model);
+-	void initDepthMap(int width);
+-	void publishPoint(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;msg,
+-				int index[], int &amp;index_size, 
+-				pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;topic);
+-
+-
+-	void velodyneCallback(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;msg);
+-	void groundSeparate(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;msg, 
+-				pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;vertical_points, 
+-				pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;ground_points);
++	ros::NodeHandle node_handle_;
++	ros::Subscriber points_node_sub_;
++	ros::Publisher groundless_points_pub_;
++	ros::Publisher ground_points_pub_;
++
++	std::string point_topic_;
++	int 		sensor_model_;
++	double 		sensor_height_;
++	double 		max_slope_;
++	int 		min_point_;
++	double 		clipping_thres_;
++	double 		gap_thres_;
++	double		point_distance_;
++	bool		floor_removal_;
++
++	int 		vertical_res_;
++	int 		horizontal_res_;
++	double 		limiting_ratio_;
++	cv::Mat 	index_map_;
++	Label 		class_label_[64];
++
++	boost::chrono::high_resolution_clock::time_point t1_;
++	boost::chrono::high_resolution_clock::time_point t2_;
++	boost::chrono::nanoseconds elap_time_;
++
++	const int 	DEFAULT_HOR_RES = 2000;
++
++	void InitLabelArray(int in_model);
++	void InitDepthMap(int in_width);
++	void PublishPointCloud(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;in_cloud_msg,
++				int in_indices[], int &amp;in_out_index_size, 
++				pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;in_cloud);
++
++
++	void VelodyneCallback(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;in_cloud_msg);
++	void FilterGround(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;in_cloud_msg,
++				pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;out_groundless_points,
++				pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;out_ground_points);
+ 
+ };
+ 
+-GroundFilter::GroundFilter() : n("~")
++GroundFilter::GroundFilter() : node_handle_("~")
+ {
++	ROS_INFO("Inititalizing Ground Filter...");
++	node_handle_.param&lt;std::string&gt;("point_topic", point_topic_, "/points_raw");	ROS_INFO("Input Point Cloud: %s", point_topic_.c_str());
++ 	node_handle_.param("remove_floor",  floor_removal_,  true);						ROS_INFO("Floor Removal: %d", floor_removal_);
++	node_handle_.param("sensor_model", sensor_model_, 64);							ROS_INFO("Sensor Model: %d", sensor_model_);
++	node_handle_.param("sensor_height", sensor_height_, 1.72);						ROS_INFO("Sensor Height: %f", sensor_height_);
++	node_handle_.param("max_slope", max_slope_, 20.0);								ROS_INFO("Max Slope: %f", max_slope_);
++	node_handle_.param("point_distance", point_distance_, 0.05);					ROS_INFO("Point Distance: %f", point_distance_);
++
++	node_handle_.param("min_point", min_point_, 3);									ROS_INFO("Min Points: %d", min_point_);
++	node_handle_.param("clipping_thres", clipping_thres_, 0.5);						ROS_INFO("Lower Clipping Threshold: %f", clipping_thres_);
++	node_handle_.param("gap_thres", gap_thres_, 0.5);								ROS_INFO("Point Gap Threshold: %f", gap_thres_);
++
++	std::string no_ground_topic, ground_topic;
++	node_handle_.param&lt;std::string&gt;("no_ground_point_topic", no_ground_topic, "/points_no_ground");	ROS_INFO("No Ground Output Point Cloud: %s", no_ground_topic.c_str());
++	node_handle_.param&lt;std::string&gt;("ground_point_topic", ground_topic, "/points_ground");	ROS_INFO("Only Ground Output Point Cloud: %s", ground_topic.c_str());
++
++	int default_horizontal_res = DEFAULT_HOR_RES;
++	switch(sensor_model_)
++	{
++		case 64:
++			default_horizontal_res = 2083;
++			break;
++		case 32:
++			default_horizontal_res = 2250;
++			break;
++		case 16:
++			default_horizontal_res = 1800;
++			break;
++	}
++	node_handle_.param("horizontal_res", horizontal_res_, default_horizontal_res);
+ 
+-	n.param&lt;std::string&gt;("point_topic", point_topic, "/points_raw");
+- 	n.param("remove_floor",  floor_removal,  true);
+-        n.param("sensor_model", sensor_model, 64);
+-        n.param("sensor_height", sensor_height, 1.72);
+-        n.param("max_slope", max_slope, 20.0);
+-	n.param("point_distance", point_distance, 0.05);
+-
+-        n.param("min_point", min_point, 3);
+-	n.param("clipping_thres", clipping_thres, 0.5);
+-	n.param("gap_thres", gap_thres, 0.5);
+-
+-	vertical_res 	= 64;
+-	horizontal_res 	= 2000;
+-	limiting_ratio 	= tan(20.0*M_PI/180);
+-        
+-	sub = n.subscribe(point_topic, 10, &amp;GroundFilter::velodyneCallback, this);
+-        vertical_points_pub = n.advertise&lt;sensor_msgs::PointCloud2&gt;("/points_lanes", 10);
+-        ground_points_pub = n.advertise&lt;sensor_msgs::PointCloud2&gt;("/points_ground", 10);
+-
+-	vertical_res = sensor_model;
+-	initLabelArray(sensor_model);
+-	limiting_ratio = tan(max_slope*M_PI/180);
++	points_node_sub_ = node_handle_.subscribe(point_topic_, 10, &amp;GroundFilter::VelodyneCallback, this);
++	groundless_points_pub_ = node_handle_.advertise&lt;sensor_msgs::PointCloud2&gt;(no_ground_topic, 10);
++	ground_points_pub_ = node_handle_.advertise&lt;sensor_msgs::PointCloud2&gt;(ground_topic, 10);
++
++	vertical_res_ = sensor_model_;
++	InitLabelArray(sensor_model_);
++	limiting_ratio_ = tan(max_slope_*M_PI/180);
+ 
+ }
+ 
+-void GroundFilter::initLabelArray(int model)
++void GroundFilter::InitLabelArray(int in_model)
+ {
+-	for(int a = 0; a &lt; vertical_res; a++)
++	for(int a = 0; a &lt; vertical_res_; a++)
+ 	{
+-		class_label[a] = UNKNOWN;
++		class_label_[a] = UNKNOWN;
+ 	}
+ }
+ 
+-void GroundFilter::initDepthMap(int width)
++void GroundFilter::InitDepthMap(int in_width)
+ {
+ 	const int mOne = -1;
+-	index_map = cv::Mat_&lt;int&gt;(vertical_res, width, mOne);
++	index_map_ = cv::Mat_&lt;int&gt;(vertical_res_, in_width, mOne);
+ }
+ 
+-void GroundFilter::publishPoint(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;msg,
+-				int index[], int &amp;index_size, 
+-				pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;topic)
++void GroundFilter::PublishPointCloud(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;in_cloud_msg,
++				int in_indices[], int &amp;in_out_index_size, 
++				pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;in_cloud)
+ {
+-
+ 	velodyne_pointcloud::PointXYZIR point;
+-	for (int i = 0; i &lt; index_size; i++)
++	for (int i = 0; i &lt; in_out_index_size; i++)
+ 	{
+-		point.x = msg-&gt;points[index[i]].x;
+-		point.y = msg-&gt;points[index[i]].y;
+-		point.z = msg-&gt;points[index[i]].z;
+-		point.intensity = msg-&gt;points[index[i]].intensity;
+-		point.ring = msg-&gt;points[index[i]].ring;
+-		topic.push_back(point);
++		point.x = in_cloud_msg-&gt;points[in_indices[i]].x;
++		point.y = in_cloud_msg-&gt;points[in_indices[i]].y;
++		point.z = in_cloud_msg-&gt;points[in_indices[i]].z;
++		point.intensity = in_cloud_msg-&gt;points[in_indices[i]].intensity;
++		point.ring = in_cloud_msg-&gt;points[in_indices[i]].ring;
++		in_cloud.push_back(point);
+ 	}
+-	index_size = 0;	
+-
++	in_out_index_size = 0;	
+ }
+ 
+-void GroundFilter::groundSeparate(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;msg, 
+-			pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;vertical_points, 
+-			pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;ground_points)
++void GroundFilter::FilterGround(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;in_cloud_msg,
++			pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;out_groundless_points,
++			pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; &amp;out_ground_points)
+ {
+ 
+-        velodyne_pointcloud::PointXYZIR point;
++	velodyne_pointcloud::PointXYZIR point;
++
++	horizontal_res_ = int(in_cloud_msg-&gt;points.size() / vertical_res_);
++	InitDepthMap(horizontal_res_);
++
++	for (size_t i = 0; i &lt; in_cloud_msg-&gt;points.size(); i++)
++	{
++		double u = atan2(in_cloud_msg-&gt;points[i].y,in_cloud_msg-&gt;points[i].x) * 180/M_PI;
++		if (u &lt; 0) u = 360 + u;
++		int column = horizontal_res_ - (int)((double)horizontal_res_ * u / 360.0) - 1;
++		int row = vertical_res_ - 1 - in_cloud_msg-&gt;points[i].ring;
++		index_map_.at&lt;int&gt;(row, column) = i;
++	}
+ 	
+-        horizontal_res = int(msg-&gt;points.size() / vertical_res);
+-        initDepthMap(horizontal_res);
+-
+-        for (int i = 0; i &lt; msg-&gt;points.size(); i++)
+-        {
+-                double u = atan2(msg-&gt;points[i].y,msg-&gt;points[i].x) * 180/M_PI;
+-                if (u &lt; 0) u = 360 + u;  
+-                int column = horizontal_res - (int)((double)horizontal_res * u / 360.0) - 1;   
+-                int row = vertical_res - 1 - msg-&gt;points[i].ring;
+-                index_map.at&lt;int&gt;(row, column) = i;
+-        }
+-
+-	for (int i = 0; i &lt; horizontal_res; i++)
+-        {
+-                Label point_class[vertical_res];
+-		int unknown_index[vertical_res];
+-		int point_index[vertical_res];
++	for (int i = 0; i &lt; horizontal_res_; i++)
++	{
++		Label point_class[vertical_res_];
++		int unknown_index[vertical_res_];
++		int point_index[vertical_res_];
+ 		int unknown_index_size = 0;
+ 		int point_index_size = 0;
+ 		double z_ref = 0;
+ 		double r_ref = 0;
+-		std::copy(class_label, class_label + vertical_res, point_class); 
+-
+-		for (int j = vertical_res - 1; j &gt;= 0; j--)
+-                {
+-                        if (index_map.at&lt;int&gt;(j,i) &gt; -1 &amp;&amp; point_class[j] == UNKNOWN)
+-                        {
+-				double x0 = msg-&gt;points[index_map.at&lt;int&gt;(j, i)].x;
+-				double y0 = msg-&gt;points[index_map.at&lt;int&gt;(j, i)].y;
+-				double z0 = msg-&gt;points[index_map.at&lt;int&gt;(j, i)].z;
++		std::copy(class_label_, class_label_ + vertical_res_, point_class); 
++
++		for (int j = vertical_res_ - 1; j &gt;= 0; j--)
++		{
++			if (index_map_.at&lt;int&gt;(j,i) &gt; -1 &amp;&amp; point_class[j] == UNKNOWN)
++			{
++				double x0 = in_cloud_msg-&gt;points[index_map_.at&lt;int&gt;(j, i)].x;
++				double y0 = in_cloud_msg-&gt;points[index_map_.at&lt;int&gt;(j, i)].y;
++				double z0 = in_cloud_msg-&gt;points[index_map_.at&lt;int&gt;(j, i)].z;
+ 				double r0 = sqrt(x0*x0 + y0*y0);
+ 				double r_diff = r0 - r_ref;
+ 				double z_diff = fabs(z0 - z_ref);
+ 				double pair_angle = z_diff/r_diff;
+-				if (((pair_angle &gt; 0 &amp;&amp; pair_angle &lt; limiting_ratio) &amp;&amp; z_diff &lt; gap_thres &amp;&amp; z0 &lt; clipping_thres) || point_index_size == 0)
++				if (((pair_angle &gt; 0 &amp;&amp; pair_angle &lt; limiting_ratio_) &amp;&amp; z_diff &lt; gap_thres_ &amp;&amp; z0 &lt; clipping_thres_) || point_index_size == 0)
+ 				{
+ 					r_ref = r0;
+ 					z_ref = z0;
+ 					point_index[point_index_size] = j;
+ 					point_index_size++;
+-				} else {
+-					if (point_index_size &gt; min_point)
++				} else
++				{
++					if (point_index_size &gt; min_point_)
+ 					{
+ 						for (int m = 0; m &lt; point_index_size; m++)
+ 						{
+ 								
+-								int index = index_map.at&lt;int&gt;(point_index[m],i);
+-								point.x = msg-&gt;points[index].x;
+-								point.y = msg-&gt;points[index].y;
+-								point.z = msg-&gt;points[index].z;
+-								point.intensity = msg-&gt;points[index].intensity;
+-								point.ring = msg-&gt;points[index].ring;
+-								ground_points.push_back(point);
++								int index = index_map_.at&lt;int&gt;(point_index[m],i);
++								point.x = in_cloud_msg-&gt;points[index].x;
++								point.y = in_cloud_msg-&gt;points[index].y;
++								point.z = in_cloud_msg-&gt;points[index].z;
++								point.intensity = in_cloud_msg-&gt;points[index].intensity;
++								point.ring = in_cloud_msg-&gt;points[index].ring;
++								out_ground_points.push_back(point);
+ 								point_class[point_index[m]] = GROUND;
+ 						}
+ 						point_index_size = 0;
+-					} else {
++					}
++					else
++					{
+ 						for (int m = 0; m &lt; point_index_size; m++)
+ 						{
+-							int index = index_map.at&lt;int&gt;(point_index[m],i);
+-							point.z = msg-&gt;points[index].z;
+-							if (point.z &gt; clipping_thres - sensor_height)
++							int index = index_map_.at&lt;int&gt;(point_index[m],i);
++							point.z = in_cloud_msg-&gt;points[index].z;
++							if (point.z &gt; clipping_thres_ - sensor_height_)
+ 							{
+-								point.x = msg-&gt;points[index].x;
+-								point.y = msg-&gt;points[index].y;
+-								point.intensity = msg-&gt;points[index].intensity;
+-								point.ring = msg-&gt;points[index].ring;
+-								vertical_points.push_back(point);
++								point.x = in_cloud_msg-&gt;points[index].x;
++								point.y = in_cloud_msg-&gt;points[index].y;
++								point.intensity = in_cloud_msg-&gt;points[index].intensity;
++								point.ring = in_cloud_msg-&gt;points[index].ring;
++								out_groundless_points.push_back(point);
+ 								point_class[point_index[m]] = VERTICAL;
+ 							} else {
+ 								unknown_index[unknown_index_size] = index;
+@@ -211,57 +229,61 @@ void GroundFilter::groundSeparate(const pcl::PointCloud&lt;velodyne_pointcloud::Poi
+ 						point_index_size = 0;
+ 					}
+ 				}
+-  			}
+-                        if (j == 0)
+-                        {
++			}
++			if (j == 0)
++			{
+ 				if (point_index_size != 0)
+ 				{
+-					if (point_index_size &gt; min_point)
++					if (point_index_size &gt; min_point_)
+ 					{
+ 						for (int m = 0; m &lt; point_index_size; m++)
+ 						{
+-								
+-								int index = index_map.at&lt;int&gt;(point_index[m],i);
+-								point.x = msg-&gt;points[index].x;
+-								point.y = msg-&gt;points[index].y;
+-								point.z = msg-&gt;points[index].z;
+-								point.intensity = msg-&gt;points[index].intensity;
+-								point.ring = msg-&gt;points[index].ring;
+-								ground_points.push_back(point);
+-								point_class[point_index[m]] = GROUND;
++							int index = index_map_.at&lt;int&gt;(point_index[m],i);
++							point.x = in_cloud_msg-&gt;points[index].x;
++							point.y = in_cloud_msg-&gt;points[index].y;
++							point.z = in_cloud_msg-&gt;points[index].z;
++							point.intensity = in_cloud_msg-&gt;points[index].intensity;
++							point.ring = in_cloud_msg-&gt;points[index].ring;
++							out_ground_points.push_back(point);
++							point_class[point_index[m]] = GROUND;
+ 						}
+ 						point_index_size = 0;
+-					} else {
++					}
++					else
++					{
+ 						for (int m = 0; m &lt; point_index_size; m++)
+ 						{
+-							int index = index_map.at&lt;int&gt;(point_index[m],i);
+-							point.z = msg-&gt;points[index].z;
+-							if (point.z &gt; clipping_thres - sensor_height)
++							int index = index_map_.at&lt;int&gt;(point_index[m],i);
++							point.z = in_cloud_msg-&gt;points[index].z;
++							if (point.z &gt; clipping_thres_ - sensor_height_)
+ 							{
+-								point.x = msg-&gt;points[index].x;
+-								point.y = msg-&gt;points[index].y;
+-								point.intensity = msg-&gt;points[index].intensity;
+-								point.ring = msg-&gt;points[index].ring;
+-								vertical_points.push_back(point);
++								point.x = in_cloud_msg-&gt;points[index].x;
++								point.y = in_cloud_msg-&gt;points[index].y;
++								point.intensity = in_cloud_msg-&gt;points[index].intensity;
++								point.ring = in_cloud_msg-&gt;points[index].ring;
++								out_groundless_points.push_back(point);
+ 								point_class[point_index[m]] = VERTICAL;
+-							} else {
++							}
++							else
++							{
+ 								unknown_index[unknown_index_size] = index;
+ 								unknown_index_size++;
+ 							}
+ 						}
+ 						point_index_size = 0;
+-					}
+-				}
++					}//end else
++				}//end if (point_index_size != 0)
++
+ 				double centroid = 0;
+-				int cluster_index[vertical_res];
++				int cluster_index[vertical_res_];
+ 				int cluster_index_size = 0;
+ 				for (int m = unknown_index_size - 1; m &gt;= 0; m--)
+ 				{
+-					double x0 = msg-&gt;points[unknown_index[m]].x;
+-					double y0 = msg-&gt;points[unknown_index[m]].y;
++					double x0 = in_cloud_msg-&gt;points[unknown_index[m]].x;
++					double y0 = in_cloud_msg-&gt;points[unknown_index[m]].y;
+ 					double r0 = sqrt(x0*x0 + y0*y0);
+ 					double r_diff = fabs(r0 - centroid);
+-					if ((r_diff &lt; point_distance) || cluster_index_size == 0)
++					if ((r_diff &lt; point_distance_) || cluster_index_size == 0)
+ 					{
+ 						cluster_index[cluster_index_size] = unknown_index[m];
+ 						cluster_index_size++;
+@@ -270,54 +292,60 @@ void GroundFilter::groundSeparate(const pcl::PointCloud&lt;velodyne_pointcloud::Poi
+ 						{
+ 							if(cluster_index_size &gt; 1)
+ 							{
+-								publishPoint(msg, cluster_index, cluster_index_size, vertical_points);
+-							} else {
+-								publishPoint(msg, cluster_index, cluster_index_size, ground_points);
++								PublishPointCloud(in_cloud_msg, cluster_index, cluster_index_size, out_groundless_points);
++							}
++							else
++							{
++								PublishPointCloud(in_cloud_msg, cluster_index, cluster_index_size, out_ground_points);
+ 							}
+ 						}
+-					} else {
++					}
++					else
++					{
+ 						if(cluster_index_size &gt; 1)
+ 						{
+-							publishPoint(msg, cluster_index, cluster_index_size, vertical_points);
+-						} else {
+-							publishPoint(msg, cluster_index, cluster_index_size, ground_points);
++							PublishPointCloud(in_cloud_msg, cluster_index, cluster_index_size, out_groundless_points);
++						}
++						else
++						{
++							PublishPointCloud(in_cloud_msg, cluster_index, cluster_index_size, out_ground_points);
+ 						}
+ 					}
+-				}
+-                        }
+-                }
++				}//end for (int m = unknown_index_size - 1; m &gt;= 0; m--)
++			}//end if (j == 0)
++		}
+ 	}
+ 
+ }
+ 
+-void GroundFilter::velodyneCallback(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;msg)
++void GroundFilter::VelodyneCallback(const pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt;::ConstPtr &amp;in_cloud_msg)
+ {
+ 
+ 	pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; vertical_points;
+ 	pcl::PointCloud&lt;velodyne_pointcloud::PointXYZIR&gt; ground_points;
+-	vertical_points.header = msg-&gt;header;
+-        ground_points.header = msg-&gt;header;
+-        vertical_points.clear();
+-        ground_points.clear();
++	vertical_points.header = in_cloud_msg-&gt;header;
++	ground_points.header = in_cloud_msg-&gt;header;
++	vertical_points.clear();
++	ground_points.clear();
+ 
+-	groundSeparate(msg, vertical_points, ground_points);
++	FilterGround(in_cloud_msg, vertical_points, ground_points);
+ 
+-	if (!floor_removal)
++	if (!floor_removal_)
+ 	{
+-		vertical_points = *msg;
++		vertical_points = *in_cloud_msg;
+ 	} 
+ 	
+-	vertical_points_pub.publish(vertical_points);
+-        ground_points_pub.publish(ground_points);
++	groundless_points_pub_.publish(vertical_points);
++	ground_points_pub_.publish(ground_points);
+ 
+ }
+ 
+ int main(int argc, char **argv)
+ {
+ 
+-        ros::init(argc, argv, "ground_filter");
++	ros::init(argc, argv, "ground_filter");
+ 	GroundFilter node;
+-        ros::spin();
++	ros::spin();
+ 
+ 	return 0;
+ 
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="d9516607c41c7006656b0330aa2373ebc912caff" author="AMC">
+		<msg>Modified as suggested by @dejanpan on #655</msg>
+		<modified_files>
+			<file old_path="ros\src\sensing\filters\packages\points_preprocessor\nodes\ground_filter\ground_filter.cpp" new_path="ros\src\sensing\filters\packages\points_preprocessor\nodes\ground_filter\ground_filter.cpp" added_lines="64" deleted_lines="33">
+				<diff>@@ -14,9 +14,9 @@
+ 
+ enum Label
+ {
+-	GROUND = 0,
+-	VERTICAL = 1,
+-	UNKNOWN = 3
++	GROUND,
++	VERTICAL,
++	UNKNOWN //Initial state, not classified
+ };
+ 
+ class GroundFilter
+@@ -71,22 +71,32 @@ private:
+ GroundFilter::GroundFilter() : node_handle_("~")
+ {
+ 	ROS_INFO("Inititalizing Ground Filter...");
+-	node_handle_.param&lt;std::string&gt;("point_topic", point_topic_, "/points_raw");	ROS_INFO("Input Point Cloud: %s", point_topic_.c_str());
+- 	node_handle_.param("remove_floor",  floor_removal_,  true);						ROS_INFO("Floor Removal: %d", floor_removal_);
+-	node_handle_.param("sensor_model", sensor_model_, 64);							ROS_INFO("Sensor Model: %d", sensor_model_);
+-	node_handle_.param("sensor_height", sensor_height_, 1.72);						ROS_INFO("Sensor Height: %f", sensor_height_);
+-	node_handle_.param("max_slope", max_slope_, 20.0);								ROS_INFO("Max Slope: %f", max_slope_);
+-	node_handle_.param("point_distance", point_distance_, 0.05);					ROS_INFO("Point Distance: %f", point_distance_);
+-
+-	node_handle_.param("min_point", min_point_, 3);									ROS_INFO("Min Points: %d", min_point_);
+-	node_handle_.param("clipping_thres", clipping_thres_, 0.5);						ROS_INFO("Lower Clipping Threshold: %f", clipping_thres_);
+-	node_handle_.param("gap_thres", gap_thres_, 0.5);								ROS_INFO("Point Gap Threshold: %f", gap_thres_);
++	node_handle_.param&lt;std::string&gt;("point_topic", point_topic_, "/points_raw");
++	ROS_INFO("Input Point Cloud: %s", point_topic_.c_str());
++ 	node_handle_.param("remove_floor",  floor_removal_,  true);
++ 	ROS_INFO("Floor Removal: %d", floor_removal_);
++	node_handle_.param("sensor_model", sensor_model_, 64);
++	ROS_INFO("Sensor Model: %d", sensor_model_);
++	node_handle_.param("sensor_height", sensor_height_, 1.72);
++	ROS_INFO("Sensor Height: %f", sensor_height_);
++	node_handle_.param("max_slope", max_slope_, 20.0);
++	ROS_INFO("Max Slope: %f", max_slope_);
++	node_handle_.param("point_distance", point_distance_, 0.05);
++	ROS_INFO("Point Distance: %f", point_distance_);
++	node_handle_.param("min_point", min_point_, 3);
++	ROS_INFO("Min Points: %d", min_point_);
++	node_handle_.param("clipping_thres", clipping_thres_, 0.5);
++	ROS_INFO("Lower Clipping Threshold: %f", clipping_thres_);
++	node_handle_.param("gap_thres", gap_thres_, 0.5);
++	ROS_INFO("Point Gap Threshold: %f", gap_thres_);
+ 
+ 	std::string no_ground_topic, ground_topic;
+-	node_handle_.param&lt;std::string&gt;("no_ground_point_topic", no_ground_topic, "/points_no_ground");	ROS_INFO("No Ground Output Point Cloud: %s", no_ground_topic.c_str());
+-	node_handle_.param&lt;std::string&gt;("ground_point_topic", ground_topic, "/points_ground");	ROS_INFO("Only Ground Output Point Cloud: %s", ground_topic.c_str());
++	node_handle_.param&lt;std::string&gt;("no_ground_point_topic", no_ground_topic, "/points_no_ground");
++	ROS_INFO("No Ground Output Point Cloud: %s", no_ground_topic.c_str());
++	node_handle_.param&lt;std::string&gt;("ground_point_topic", ground_topic, "/points_ground");
++	ROS_INFO("Only Ground Output Point Cloud: %s", ground_topic.c_str());
+ 
+-	int default_horizontal_res = DEFAULT_HOR_RES;
++	int default_horizontal_res;
+ 	switch(sensor_model_)
+ 	{
+ 		case 64:
+@@ -98,12 +108,15 @@ GroundFilter::GroundFilter() : node_handle_("~")
+ 		case 16:
+ 			default_horizontal_res = 1800;
+ 			break;
++		default:
++			default_horizontal_res = DEFAULT_HOR_RES;
++			break;
+ 	}
+ 	node_handle_.param("horizontal_res", horizontal_res_, default_horizontal_res);
+ 
+-	points_node_sub_ = node_handle_.subscribe(point_topic_, 10, &amp;GroundFilter::VelodyneCallback, this);
+-	groundless_points_pub_ = node_handle_.advertise&lt;sensor_msgs::PointCloud2&gt;(no_ground_topic, 10);
+-	ground_points_pub_ = node_handle_.advertise&lt;sensor_msgs::PointCloud2&gt;(ground_topic, 10);
++	points_node_sub_ = node_handle_.subscribe(point_topic_, 2, &amp;GroundFilter::VelodyneCallback, this);
++	groundless_points_pub_ = node_handle_.advertise&lt;sensor_msgs::PointCloud2&gt;(no_ground_topic, 2);
++	ground_points_pub_ = node_handle_.advertise&lt;sensor_msgs::PointCloud2&gt;(ground_topic, 2);
+ 
+ 	vertical_res_ = sensor_model_;
+ 	InitLabelArray(sensor_model_);
+@@ -155,7 +168,7 @@ void GroundFilter::FilterGround(const pcl::PointCloud&lt;velodyne_pointcloud::Point
+ 	for (size_t i = 0; i &lt; in_cloud_msg-&gt;points.size(); i++)
+ 	{
+ 		double u = atan2(in_cloud_msg-&gt;points[i].y,in_cloud_msg-&gt;points[i].x) * 180/M_PI;
+-		if (u &lt; 0) u = 360 + u;
++		if (u &lt; 0) { u = 360 + u; }
+ 		int column = horizontal_res_ - (int)((double)horizontal_res_ * u / 360.0) - 1;
+ 		int row = vertical_res_ - 1 - in_cloud_msg-&gt;points[i].ring;
+ 		index_map_.at&lt;int&gt;(row, column) = i;
+@@ -182,28 +195,44 @@ void GroundFilter::FilterGround(const pcl::PointCloud&lt;velodyne_pointcloud::Point
+ 				double r0 = sqrt(x0*x0 + y0*y0);
+ 				double r_diff = r0 - r_ref;
+ 				double z_diff = fabs(z0 - z_ref);
+-				double pair_angle = z_diff/r_diff;
+-				if (((pair_angle &gt; 0 &amp;&amp; pair_angle &lt; limiting_ratio_) &amp;&amp; z_diff &lt; gap_thres_ &amp;&amp; z0 &lt; clipping_thres_) || point_index_size == 0)
++				double pair_angle;
++
++				if (r_diff != 0.)
++				{
++					pair_angle = z_diff/r_diff;
++				}
++				else
++				{//this should never execute due to Sensor specs
++					ROS_ERROR("GrooundFilter: Division by Zero avoided on pair_angle");
++					pair_angle = 0;
++				}
++				if (
++					 (	(pair_angle &gt; 0 &amp;&amp; pair_angle &lt; limiting_ratio_)
++						&amp;&amp; z_diff &lt; gap_thres_
++						&amp;&amp; z0 &lt; clipping_thres_
++					 )
++					|| point_index_size == 0
++					)
+ 				{
+ 					r_ref = r0;
+ 					z_ref = z0;
+ 					point_index[point_index_size] = j;
+ 					point_index_size++;
+-				} else
++				}
++				else
+ 				{
+ 					if (point_index_size &gt; min_point_)
+ 					{
+ 						for (int m = 0; m &lt; point_index_size; m++)
+ 						{
+-								
+-								int index = index_map_.at&lt;int&gt;(point_index[m],i);
+-								point.x = in_cloud_msg-&gt;points[index].x;
+-								point.y = in_cloud_msg-&gt;points[index].y;
+-								point.z = in_cloud_msg-&gt;points[index].z;
+-								point.intensity = in_cloud_msg-&gt;points[index].intensity;
+-								point.ring = in_cloud_msg-&gt;points[index].ring;
+-								out_ground_points.push_back(point);
+-								point_class[point_index[m]] = GROUND;
++							int index = index_map_.at&lt;int&gt;(point_index[m],i);
++							point.x = in_cloud_msg-&gt;points[index].x;
++							point.y = in_cloud_msg-&gt;points[index].y;
++							point.z = in_cloud_msg-&gt;points[index].z;
++							point.intensity = in_cloud_msg-&gt;points[index].intensity;
++							point.ring = in_cloud_msg-&gt;points[index].ring;
++							out_ground_points.push_back(point);
++							point_class[point_index[m]] = GROUND;
+ 						}
+ 						point_index_size = 0;
+ 					}
+@@ -221,7 +250,9 @@ void GroundFilter::FilterGround(const pcl::PointCloud&lt;velodyne_pointcloud::Point
+ 								point.ring = in_cloud_msg-&gt;points[index].ring;
+ 								out_groundless_points.push_back(point);
+ 								point_class[point_index[m]] = VERTICAL;
+-							} else {
++							}
++							else
++							{
+ 								unknown_index[unknown_index_size] = index;
+ 								unknown_index_size++;
+ 							}
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="046b973dae7e21b1cfa73f772fade9557e5b1157" author="Patiphon Narksri">
+		<msg>Fixed a bug that caused missing points</msg>
+		<modified_files>
+			<file old_path="ros\src\sensing\filters\packages\points_preprocessor\nodes\ground_filter\ground_filter.cpp" new_path="ros\src\sensing\filters\packages\points_preprocessor\nodes\ground_filter\ground_filter.cpp" added_lines="21" deleted_lines="1">
+				<diff>@@ -162,7 +162,8 @@ void GroundFilter::FilterGround(const pcl::PointCloud&lt;velodyne_pointcloud::Point
+ 
+ 	velodyne_pointcloud::PointXYZIR point;
+ 
+-	horizontal_res_ = int(in_cloud_msg-&gt;points.size() / vertical_res_);
++	//This line is not necessary
++	//horizontal_res_ = int(in_cloud_msg-&gt;points.size() / vertical_res_);
+ 	InitDepthMap(horizontal_res_);
+ 
+ 	for (size_t i = 0; i &lt; in_cloud_msg-&gt;points.size(); i++)
+@@ -259,6 +260,11 @@ void GroundFilter::FilterGround(const pcl::PointCloud&lt;velodyne_pointcloud::Point
+ 						}
+ 						point_index_size = 0;
+ 					}
++					//These line were missing
++					r_ref = r0;
++					z_ref = z0;
++					point_index[point_index_size] = j;
++					point_index_size++;
+ 				}
+ 			}
+ 			if (j == 0)
+@@ -332,6 +338,20 @@ void GroundFilter::FilterGround(const pcl::PointCloud&lt;velodyne_pointcloud::Point
+ 						}
+ 					}
+ 					else
++					{
++						if(cluster_index_size &gt; 1)
++						{
++							PublishPointCloud(in_cloud_msg, cluster_index, cluster_index_size, out_groundless_points);
++						}
++						else
++						{
++							PublishPointCloud(in_cloud_msg, cluster_index, cluster_index_size, out_ground_points);
++						}
++						cluster_index[cluster_index_size] = unknown_index[m];
++						cluster_index_size++;
++						centroid = r0;
++					}
++					if (m == 0)
+ 					{
+ 						if(cluster_index_size &gt; 1)
+ 						{
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="29b934b98b12aec3f9053e23bb3e0517dde925cf" author="AMC">
+		<msg>Typo Fix</msg>
+		<modified_files>
+			<file old_path="ros\src\sensing\filters\packages\points_preprocessor\nodes\ground_filter\ground_filter.cpp" new_path="ros\src\sensing\filters\packages\points_preprocessor\nodes\ground_filter\ground_filter.cpp" added_lines="1" deleted_lines="1">
+				<diff>@@ -204,7 +204,7 @@ void GroundFilter::FilterGround(const pcl::PointCloud&lt;velodyne_pointcloud::Point
+ 				}
+ 				else
+ 				{//this should never execute due to Sensor specs
+-					ROS_ERROR("GrooundFilter: Division by Zero avoided on pair_angle");
++					ROS_ERROR("GroundFilter: Division by Zero avoided on pair_angle");
+ 					pair_angle = 0;
+ 				}
+ 				if (
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="496f84c039b5ca7642f6b2136967d72d432d5f25" author="Akihito OHSATO">
+		<msg>Add visualization/rosparam and some refactoring</msg>
+		<modified_files>
+			<file old_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" new_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" added_lines="103" deleted_lines="80">
+				<diff>@@ -43,6 +43,7 @@ static tf::StampedTransform transform;
+ 
+ static vector_map::VectorMap vmap;
+ static ros::ServiceClient vmap_server;
++static bool use_vmap;
+ static double vmap_threshold;
+ 
+ struct obj_label_t {
+@@ -151,12 +152,9 @@ static void fusion_objects(void) {
+   int id = 0;
+ 
+   for (unsigned int i = 0; i &lt; obj_label_current.obj_id.size(); ++i) {
+-    jsk_recognition_msgs::BoundingBox bounding_box;
+-    if (obj_indices.at(i) == -1)
+-      continue;
++    if (obj_indices.at(i) == -1) continue;
+ 
+     v_cloud_cluster_current.at(obj_indices.at(i)).label = object_type;
+-
+     if (object_type == "car") {
+       v_cloud_cluster_current.at(obj_indices.at(i)).bounding_box.label = 0;
+     } else if (object_type == "person") {
+@@ -165,60 +163,79 @@ static void fusion_objects(void) {
+       v_cloud_cluster_current.at(obj_indices.at(i)).bounding_box.label = 2;
+       v_cloud_cluster_current.at(obj_indices.at(i)).label = "unknown";
+     }
+-    v_cloud_cluster_current.at(obj_indices.at(i)).bounding_box.value =
+-        obj_label_current.obj_id.at(i);
++
++    jsk_recognition_msgs::BoundingBox bounding_box;
+     bounding_box = v_cloud_cluster_current.at(obj_indices.at(i)).bounding_box;
+-    pub_msg.boxes.push_back(bounding_box);
+-    cloud_clusters_msg.clusters.push_back(
+-        v_cloud_cluster_current.at(obj_indices.at(i)));
+ 
+-    tf::Quaternion q1(bounding_box.pose.orientation.x, bounding_box.pose.orientation.y, bounding_box.pose.orientation.z, bounding_box.pose.orientation.w);
+-    vector_map_server::GetLane get_lane;
+-    get_lane.request.pose.pose = bounding_box.pose;
+-    tf::Vector3 orgpt(bounding_box.pose.position.x, bounding_box.pose.position.y, bounding_box.pose.position.z);
+-    tf::Vector3 convpt = tform * orgpt;
+-    get_lane.request.pose.pose.position.x = convpt.x();
+-    get_lane.request.pose.pose.position.y = convpt.y();
+-    get_lane.request.pose.pose.position.z = convpt.z();
+-    ROS_INFO("pos x=%f y=%f z=%f", get_lane.request.pose.pose.position.x, get_lane.request.pose.pose.position.y, get_lane.request.pose.pose.position.z);
+-    //get_lane.request.waypoints.waypoints.clear();
+-    if (vmap_server.call(get_lane)) {
+-      for (const auto&amp; lane : get_lane.response.objects.data) {
+-        Node bn = vmap.findByKey(Key&lt;Node&gt;(lane.bnid));
+-        Point bp = vmap.findByKey(Key&lt;Point&gt;(bn.pid));
+-        Node fn = vmap.findByKey(Key&lt;Node&gt;(lane.fnid));
+-        Point fp = vmap.findByKey(Key&lt;Point&gt;(fn.pid));
+-        ROS_INFO(" lane bn=(%f,%f) fn=(%f,%f)", bp.ly, bp.bx, fp.ly, fp.bx);
+-        double mx = get_lane.request.pose.pose.position.x;
+-        double my = get_lane.request.pose.pose.position.y;
+-        if ((mx - fp.ly)*(mx - fp.ly) + (my - fp.bx)*(my - fp.bx) &lt; vmap_threshold) {
+-          tf::Quaternion ql;
+-          ql.setRPY(0, 0, atan2(fp.bx - bp.bx, fp.ly - bp.ly)); // y,x
+-          tf::Quaternion qb = tform * q1;
+-          tf::Quaternion qm;
+-          qm.setRPY(0, 0, M_PI/2);
+-          double mr = M_PI;
+-          int mi = 0;
+-          for (int i = 0; i &lt; 4; i++) { // 0,90,180,270-degree
+-            double r = ql.angle(qb);
+-            r = (r &gt;= M_PI/2) ? (r - M_PI):r;
+-            if (fabs(r) &lt; mr) {
+-              mr = fabs(r);
+-              mi = i;
++    /* adjust object rotation using lane in vector_map */
++    tf::Quaternion q1(bounding_box.pose.orientation.x,
++      bounding_box.pose.orientation.y,
++      bounding_box.pose.orientation.z,
++      bounding_box.pose.orientation.w);
++    bool fixed_rotation = false;
++    if (use_vmap) {
++      int mi = 0; // number of rotaiton 90deg
++      vector_map_server::GetLane get_lane;
++      get_lane.request.pose.pose = bounding_box.pose;
++      tf::Vector3 orgpt(bounding_box.pose.position.x,
++        bounding_box.pose.position.y,
++        bounding_box.pose.position.z);
++      tf::Vector3 convpt = tform * orgpt;
++      get_lane.request.pose.pose.position.x = convpt.x();
++      get_lane.request.pose.pose.position.y = convpt.y();
++      get_lane.request.pose.pose.position.z = convpt.z();
++      ROS_INFO("pos x=%f y=%f z=%f",
++        get_lane.request.pose.pose.position.x,
++        get_lane.request.pose.pose.position.y,
++        get_lane.request.pose.pose.position.z);
++      if (vmap_server.call(get_lane)) {
++        for (const auto&amp; lane : get_lane.response.objects.data) {
++          Node bn = vmap.findByKey(Key&lt;Node&gt;(lane.bnid));
++          Point bp = vmap.findByKey(Key&lt;Point&gt;(bn.pid));
++          Node fn = vmap.findByKey(Key&lt;Node&gt;(lane.fnid));
++          Point fp = vmap.findByKey(Key&lt;Point&gt;(fn.pid));
++          ROS_INFO(" lane bn=(%f,%f) fn=(%f,%f)", bp.ly, bp.bx, fp.ly, fp.bx);
++          double mx = get_lane.request.pose.pose.position.x;
++          double my = get_lane.request.pose.pose.position.y;
++          if ((mx-fp.ly)*(mx-fp.ly)+(my-fp.bx)*(my-fp.bx) &lt; vmap_threshold) {
++            fixed_rotation = true;
++            tf::Quaternion ql;
++            ql.setRPY(0, 0, atan2(fp.bx - bp.bx, fp.ly - bp.ly)); // y,x
++            tf::Quaternion qb = tform * q1;
++            tf::Quaternion qm;
++            qm.setRPY(0, 0, M_PI/2);
++            double mr = M_PI;
++            // search in 0,90,180,270-degree
++            for (int i = 0; i &lt; 4; i++) {
++              double r = ql.angle(qb);
++              r = (r &gt;= M_PI/2) ? (r - M_PI):r;
++              if (fabs(r) &lt; mr) {
++                mr = fabs(r);
++                mi = i;
++              }
++              qb *= qm;
+             }
+-            qb *= qm;
++            double roll, pitch, yaw;
++            tf::Matrix3x3(q1).getRPY(roll, pitch, yaw);
++            ROS_INFO(" %d roll=%f pitch=%f yaw=%f", mi*90, roll, pitch, yaw);
++            break;
+           }
+-          if (mi &gt; 0) {
+-            qm.setRPY(0, 0, M_PI*mi/2);
+-            q1 *= qm;
+-          }
+-          double roll, pitch, yaw;
+-          tf::Matrix3x3(q1).getRPY(roll, pitch, yaw);
+-          ROS_INFO(" %d roll=%f pitch=%f yaw=%f", mi*90, roll, pitch, yaw);
+         }
++      } else {
++        ROS_INFO("%s: VectorMap Server call failed.", __FUNCTION__);
++      }
++      // determine rotation
++      tf::Quaternion dq1;
++      dq1.setRPY(0, 0, M_PI*mi/2);
++      q1 *= dq1;
++      // bounding_box
++      bounding_box.pose.orientation.x = q1.x();
++      bounding_box.pose.orientation.y = q1.y();
++      bounding_box.pose.orientation.z = q1.z();
++      bounding_box.pose.orientation.w = q1.w();
++      if (mi % 2 == 1) { // swap x-y at 90,270 deg
++        std::swap(bounding_box.dimensions.x, bounding_box.dimensions.y);
+       }
+-    } else {
+-      ROS_INFO("%s: VectorMap Server call failed.", __FUNCTION__);
+     }
+ 
+     // x-axis
+@@ -228,10 +245,7 @@ static void fusion_objects(void) {
+     marker.lifetime = ros::Duration(0.1);
+     marker.type = visualization_msgs::Marker::ARROW;
+     marker.pose.position = bounding_box.pose.position;
+-    marker.pose.orientation.x = q1.x();
+-    marker.pose.orientation.y = q1.y();
+-    marker.pose.orientation.z = q1.z();
+-    marker.pose.orientation.w = q1.w();
++    marker.pose.orientation = bounding_box.pose.orientation;
+     marker.scale.x = 2.0;
+     marker.scale.y = 0.2;
+     marker.scale.z = 0.1;
+@@ -266,15 +280,41 @@ static void fusion_objects(void) {
+     marker.color.b = 1.0;
+     marker.color.a = 1.0;
+     marker_array_msg.markers.push_back(marker);
++
++    // rotated by lane
++    if (fixed_rotation) {
++      marker.id = id++;
++      marker.type = visualization_msgs::Marker::SPHERE;
++      marker.scale.x = 1.0;
++      marker.scale.y = 1.0;
++      marker.scale.z = 1.0;
++      marker.color.g = 1.0;
++      marker.color.b = 1.0;
++      marker.color.a = 1.0;
++      marker_array_msg.markers.push_back(marker);
++    }
++
++    v_cloud_cluster_current.at(obj_indices.at(i)).bounding_box.value =
++        obj_label_current.obj_id.at(i);
++    pub_msg.boxes.push_back(bounding_box);
++    cloud_clusters_msg.clusters.push_back(
++        v_cloud_cluster_current.at(obj_indices.at(i)));
+   }
+-  marker_array_pub.publish(marker_array_msg);
+-  //marker_array_msg.markers.clear();
+ 
++  marker_array_pub.publish(marker_array_msg);
+   obj_pose_pub.publish(pub_msg);
+   cluster_class_pub.publish(cloud_clusters_msg);
+   std_msgs::Time time;
+   time.data = obj_pose_timestamp;
+   obj_pose_timestamp_pub.publish(time);
++
++  LOCK(mtx_flag_obj_label);
++  isReady_obj_label = false;
++  UNLOCK(mtx_flag_obj_label);
++
++  LOCK(mtx_flag_cluster_centroids);
++  isReady_cluster_centroids = false;
++  UNLOCK(mtx_flag_cluster_centroids);
+ }
+ 
+ void obj_label_cb(const autoware_msgs::obj_label &amp;obj_label_msg) {
+@@ -302,14 +342,6 @@ void obj_label_cb(const autoware_msgs::obj_label &amp;obj_label_msg) {
+   /* Publish fusion result if both of topics are ready */
+   if (isReady_obj_label &amp;&amp; isReady_cluster_centroids) {
+     fusion_objects();
+-
+-    LOCK(mtx_flag_obj_label);
+-    isReady_obj_label = false;
+-    UNLOCK(mtx_flag_obj_label);
+-
+-    LOCK(mtx_flag_cluster_centroids);
+-    isReady_cluster_centroids = false;
+-    UNLOCK(mtx_flag_cluster_centroids);
+   }
+ 
+ } /* void obj_label_cb() */
+@@ -355,14 +387,6 @@ void cluster_centroids_cb(
+   /* Publish fusion result if both of topics are ready */
+   if (isReady_obj_label &amp;&amp; isReady_cluster_centroids) {
+     fusion_objects();
+-
+-    LOCK(mtx_flag_obj_label);
+-    isReady_obj_label = false;
+-    UNLOCK(mtx_flag_obj_label);
+-
+-    LOCK(mtx_flag_cluster_centroids);
+-    isReady_cluster_centroids = false;
+-    UNLOCK(mtx_flag_cluster_centroids);
+   }
+ 
+ } /* void cluster_centroids_cb() */
+@@ -374,16 +398,15 @@ int main(int argc, char *argv[]) {
+   ros::NodeHandle n;
+   ros::NodeHandle private_n("~");
+ 
+-  if (!private_n.getParam("min_dist", threshold_min_dist)) {
+-    threshold_min_dist = 2.0;
+-  }
++  private_n.param("min_dist", threshold_min_dist, 2.0);
++  private_n.param("use_vmap", use_vmap, true);
++  private_n.param("vmap_threshold", vmap_threshold, 5.0);
++  vmap_threshold *= vmap_threshold; // squared
++
+   /* Initialize flags */
+   isReady_obj_label = false;
+   isReady_cluster_centroids = false;
+ 
+-  private_n.param("vmap_threshold", vmap_threshold, 5.0);
+-  vmap_threshold *= vmap_threshold;
+-
+   ros::Subscriber obj_label_sub =
+       n.subscribe("obj_label", SUBSCRIBE_QUEUE_SIZE, obj_label_cb);
+   ros::Subscriber cluster_centroids_sub = n.subscribe(
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="ae3c6e47ab9b0ee7cdece019cf02fab1903c22b7" author="Akihito OHSATO">
+		<msg>Change time-sync, flag/mutex -&gt; sync_policies::ApproximateTime</msg>
+		<modified_files>
+			<file old_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" new_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" added_lines="75" deleted_lines="151">
+				<diff>@@ -14,15 +14,14 @@
+ #include &lt;tf/transform_listener.h&gt;
+ #include &lt;vector_map/vector_map.h&gt;
+ #include &lt;vector_map_server/GetLane.h&gt;
++#include &lt;message_filters/subscriber.h&gt;
++#include &lt;message_filters/synchronizer.h&gt;
++#include &lt;message_filters/sync_policies/approximate_time.h&gt;
+ 
+ using vector_map::Node;
+ using vector_map::Point;
+ using vector_map::Key;
+ 
+-/* flag for comfirming whether multiple topics are received */
+-static bool isReady_obj_label;
+-static bool isReady_cluster_centroids;
+-
+ static constexpr uint32_t SUBSCRIBE_QUEUE_SIZE = 100;
+ static constexpr uint32_t ADVERTISE_QUEUE_SIZE = 10;
+ static constexpr bool ADVERTISE_LATCH = false;
+@@ -39,7 +38,6 @@ static std_msgs::Header sensor_header;
+ static std::vector&lt;autoware_msgs::CloudCluster&gt; v_cloud_cluster;
+ static ros::Time obj_pose_timestamp;
+ static double threshold_min_dist;
+-static tf::StampedTransform transform;
+ 
+ static vector_map::VectorMap vmap;
+ static ros::ServiceClient vmap_server;
+@@ -50,17 +48,8 @@ struct obj_label_t {
+   std::vector&lt;geometry_msgs::Point&gt; reprojected_positions;
+   std::vector&lt;int&gt; obj_id;
+ };
+-
+ obj_label_t obj_label;
+ 
+-/* mutex to handle objects from within multi thread safely */
+-std::mutex mtx_flag_obj_label;
+-std::mutex mtx_flag_cluster_centroids;
+-std::mutex mtx_reprojected_positions;
+-std::mutex mtx_centroids;
+-#define LOCK(mtx) (mtx).lock()
+-#define UNLOCK(mtx) (mtx).unlock()
+-
+ static double euclid_distance(const geometry_msgs::Point pos1,
+                               const geometry_msgs::Point pos2) {
+   return sqrt(pow(pos1.x - pos2.x, 2) + pow(pos1.y - pos2.y, 2) +
+@@ -69,29 +58,55 @@ static double euclid_distance(const geometry_msgs::Point pos1,
+ } /* static double distance() */
+ 
+ /* fusion reprojected position and pointcloud centroids */
+-static void fusion_objects(void) {
+-  obj_label_t obj_label_current;
+-  std::vector&lt;autoware_msgs::CloudCluster&gt; v_cloud_cluster_current;
++void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
++  const autoware_msgs::CloudClusterArray::ConstPtr &amp;in_cloud_cluster_array_ptr) {
++
++  tf::StampedTransform tform;
++  tf::TransformListener tflistener;
++  try {
++    ros::Time now = ros::Time(0);
++    tflistener.waitForTransform("/map", "/velodyne", now, ros::Duration(10));
++    tflistener.lookupTransform("/map", "/velodyne", now, tform);
++  } catch (tf::TransformException ex) {
++    ROS_INFO("%s: %s", __FUNCTION__, ex.what());
++    return;
++  }
++
++  obj_label_t obj_label;
++  object_type = obj_label_msg-&gt;type;
++  obj_pose_timestamp = obj_label_msg-&gt;header.stamp;
++
++  for (unsigned int i = 0; i &lt; obj_label_msg-&gt;obj_id.size(); ++i) {
++    obj_label.reprojected_positions.push_back(
++        obj_label_msg-&gt;reprojected_pos.at(i));
++    obj_label.obj_id.push_back(obj_label_msg-&gt;obj_id.at(i));
++  }
++
++  std::vector&lt;autoware_msgs::CloudCluster&gt; v_cloud_cluster;
+   std_msgs::Header header = sensor_header;
+-  std::vector&lt;geometry_msgs::Point&gt; centroids_current;
+-
+-  LOCK(mtx_reprojected_positions);
+-  copy(obj_label.reprojected_positions.begin(),
+-       obj_label.reprojected_positions.end(),
+-       back_inserter(obj_label_current.reprojected_positions));
+-  copy(obj_label.obj_id.begin(), obj_label.obj_id.end(),
+-       back_inserter(obj_label_current.obj_id));
+-  UNLOCK(mtx_reprojected_positions);
+-
+-  LOCK(mtx_centroids);
+-  copy(centroids.begin(), centroids.end(), back_inserter(centroids_current));
+-  copy(v_cloud_cluster.begin(), v_cloud_cluster.end(),
+-       back_inserter(v_cloud_cluster_current));
+-  UNLOCK(mtx_centroids);
+-
+-  if (centroids_current.empty() ||
+-      obj_label_current.reprojected_positions.empty() ||
+-      obj_label_current.obj_id.empty()) {
++  std::vector&lt;geometry_msgs::Point&gt; centroids;
++
++  for (int i(0); i &lt; (int)in_cloud_cluster_array_ptr-&gt;clusters.size(); ++i) {
++    autoware_msgs::CloudCluster cloud_cluster =
++        in_cloud_cluster_array_ptr-&gt;clusters.at(i);
++    /* convert centroids coodinate from velodyne frame to map frame */
++    tf::Vector3 pt(cloud_cluster.centroid_point.point.x,
++                   cloud_cluster.centroid_point.point.y,
++                   cloud_cluster.centroid_point.point.z);
++    tf::Vector3 converted = tform * pt;
++    sensor_header = cloud_cluster.header;
++    v_cloud_cluster.push_back(cloud_cluster);
++    geometry_msgs::Point point_in_map;
++    point_in_map.x = converted.x();
++    point_in_map.y = converted.y();
++    point_in_map.z = converted.z();
++
++    centroids.push_back(point_in_map);
++  }
++
++  if (centroids.empty() ||
++      obj_label.reprojected_positions.empty() ||
++      obj_label.obj_id.empty()) {
+     jsk_recognition_msgs::BoundingBoxArray pub_msg;
+     pub_msg.header = header;
+     std_msgs::Time time;
+@@ -101,24 +116,22 @@ static void fusion_objects(void) {
+     cluster_class_pub.publish(cloud_clusters_msg);
+     visualization_msgs::MarkerArray marker_array_msg;
+     marker_array_pub.publish(marker_array_msg);
+-
+     time.data = obj_pose_timestamp;
+     obj_pose_timestamp_pub.publish(time);
+     return;
+   }
+ 
+   std::vector&lt;int&gt; obj_indices;
+-
+-  for (unsigned int i = 0; i &lt; obj_label_current.obj_id.size(); ++i) {
++  for (unsigned int i = 0; i &lt; obj_label.obj_id.size(); ++i) {
+     unsigned int min_idx = 0;
+     double min_distance = DBL_MAX;
+ 
+     /* calculate each euclid distance between reprojected position and centroids
+      */
+-    for (unsigned int j = 0; j &lt; centroids_current.size(); j++) {
++    for (unsigned int j = 0; j &lt; centroids.size(); j++) {
+       double distance =
+-          euclid_distance(obj_label_current.reprojected_positions.at(i),
+-                          centroids_current.at(j));
++          euclid_distance(obj_label.reprojected_positions.at(i),
++                          centroids.at(j));
+ 
+       /* Nearest centroid correspond to this reprojected object */
+       if (distance &lt; min_distance) {
+@@ -138,34 +151,24 @@ static void fusion_objects(void) {
+   pub_msg.header = header;
+   autoware_msgs::CloudClusterArray cloud_clusters_msg;
+   cloud_clusters_msg.header = header;
+-
+-  tf::StampedTransform tform;
+-  tf::TransformListener listener;
+-  try {
+-    ros::Time now = ros::Time(0);
+-    listener.waitForTransform("/map", "/velodyne", now, ros::Duration(10));
+-    listener.lookupTransform("/map", "/velodyne", now, tform);
+-  } catch (tf::TransformException ex) {
+-    ROS_INFO("%s: %s", __FUNCTION__, ex.what());
+-  }
+   visualization_msgs::MarkerArray marker_array_msg;
+   int id = 0;
+ 
+-  for (unsigned int i = 0; i &lt; obj_label_current.obj_id.size(); ++i) {
++  for (unsigned int i = 0; i &lt; obj_label.obj_id.size(); ++i) {
+     if (obj_indices.at(i) == -1) continue;
+ 
+-    v_cloud_cluster_current.at(obj_indices.at(i)).label = object_type;
++    v_cloud_cluster.at(obj_indices.at(i)).label = object_type;
+     if (object_type == "car") {
+-      v_cloud_cluster_current.at(obj_indices.at(i)).bounding_box.label = 0;
++      v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = 0;
+     } else if (object_type == "person") {
+-      v_cloud_cluster_current.at(obj_indices.at(i)).bounding_box.label = 1;
++      v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = 1;
+     } else {
+-      v_cloud_cluster_current.at(obj_indices.at(i)).bounding_box.label = 2;
+-      v_cloud_cluster_current.at(obj_indices.at(i)).label = "unknown";
++      v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = 2;
++      v_cloud_cluster.at(obj_indices.at(i)).label = "unknown";
+     }
+ 
+     jsk_recognition_msgs::BoundingBox bounding_box;
+-    bounding_box = v_cloud_cluster_current.at(obj_indices.at(i)).bounding_box;
++    bounding_box = v_cloud_cluster.at(obj_indices.at(i)).bounding_box;
+ 
+     /* adjust object rotation using lane in vector_map */
+     tf::Quaternion q1(bounding_box.pose.orientation.x,
+@@ -236,6 +239,7 @@ static void fusion_objects(void) {
+       if (mi % 2 == 1) { // swap x-y at 90,270 deg
+         std::swap(bounding_box.dimensions.x, bounding_box.dimensions.y);
+       }
++      v_cloud_cluster.at(obj_indices.at(i)).bounding_box = bounding_box;
+     }
+ 
+     // x-axis
+@@ -294,11 +298,11 @@ static void fusion_objects(void) {
+       marker_array_msg.markers.push_back(marker);
+     }
+ 
+-    v_cloud_cluster_current.at(obj_indices.at(i)).bounding_box.value =
+-        obj_label_current.obj_id.at(i);
++    v_cloud_cluster.at(obj_indices.at(i)).bounding_box.value
++      = obj_label.obj_id.at(i);
+     pub_msg.boxes.push_back(bounding_box);
+     cloud_clusters_msg.clusters.push_back(
+-        v_cloud_cluster_current.at(obj_indices.at(i)));
++      v_cloud_cluster.at(obj_indices.at(i)));
+   }
+ 
+   marker_array_pub.publish(marker_array_msg);
+@@ -307,90 +311,8 @@ static void fusion_objects(void) {
+   std_msgs::Time time;
+   time.data = obj_pose_timestamp;
+   obj_pose_timestamp_pub.publish(time);
+-
+-  LOCK(mtx_flag_obj_label);
+-  isReady_obj_label = false;
+-  UNLOCK(mtx_flag_obj_label);
+-
+-  LOCK(mtx_flag_cluster_centroids);
+-  isReady_cluster_centroids = false;
+-  UNLOCK(mtx_flag_cluster_centroids);
+ }
+ 
+-void obj_label_cb(const autoware_msgs::obj_label &amp;obj_label_msg) {
+-  object_type = obj_label_msg.type;
+-  obj_pose_timestamp = obj_label_msg.header.stamp;
+-
+-  LOCK(mtx_reprojected_positions);
+-  obj_label.reprojected_positions.clear();
+-  obj_label.obj_id.clear();
+-  UNLOCK(mtx_reprojected_positions);
+-
+-  LOCK(mtx_reprojected_positions);
+-  for (unsigned int i = 0; i &lt; obj_label_msg.obj_id.size(); ++i) {
+-    obj_label.reprojected_positions.push_back(
+-        obj_label_msg.reprojected_pos.at(i));
+-    obj_label.obj_id.push_back(obj_label_msg.obj_id.at(i));
+-  }
+-  UNLOCK(mtx_reprojected_positions);
+-
+-  /* confirm obj_label is subscribed */
+-  LOCK(mtx_flag_obj_label);
+-  isReady_obj_label = true;
+-  UNLOCK(mtx_flag_obj_label);
+-
+-  /* Publish fusion result if both of topics are ready */
+-  if (isReady_obj_label &amp;&amp; isReady_cluster_centroids) {
+-    fusion_objects();
+-  }
+-
+-} /* void obj_label_cb() */
+-
+-void cluster_centroids_cb(
+-    const autoware_msgs::CloudClusterArray::Ptr &amp;in_cloud_cluster_array_ptr) {
+-  LOCK(mtx_centroids);
+-  centroids.clear();
+-  v_cloud_cluster.clear();
+-  UNLOCK(mtx_centroids);
+-
+-  LOCK(mtx_centroids);
+-  static tf::TransformListener trf_listener;
+-  try {
+-    trf_listener.lookupTransform("map", "velodyne", ros::Time(0), transform);
+-    for (int i(0); i &lt; (int)in_cloud_cluster_array_ptr-&gt;clusters.size(); ++i) {
+-      autoware_msgs::CloudCluster cloud_cluster =
+-          in_cloud_cluster_array_ptr-&gt;clusters.at(i);
+-      /* convert centroids coodinate from velodyne frame to map frame */
+-      tf::Vector3 pt(cloud_cluster.centroid_point.point.x,
+-                     cloud_cluster.centroid_point.point.y,
+-                     cloud_cluster.centroid_point.point.z);
+-      tf::Vector3 converted = transform * pt;
+-      sensor_header = cloud_cluster.header;
+-      v_cloud_cluster.push_back(cloud_cluster);
+-      geometry_msgs::Point point_in_map;
+-      point_in_map.x = converted.x();
+-      point_in_map.y = converted.y();
+-      point_in_map.z = converted.z();
+-
+-      centroids.push_back(point_in_map);
+-    }
+-  } catch (tf::TransformException ex) {
+-    ROS_INFO("%s", ex.what());
+-    ros::Duration(1.0).sleep();
+-  }
+-  UNLOCK(mtx_centroids);
+-
+-  LOCK(mtx_flag_cluster_centroids);
+-  isReady_cluster_centroids = true;
+-  UNLOCK(mtx_flag_cluster_centroids);
+-
+-  /* Publish fusion result if both of topics are ready */
+-  if (isReady_obj_label &amp;&amp; isReady_cluster_centroids) {
+-    fusion_objects();
+-  }
+-
+-} /* void cluster_centroids_cb() */
+-
+ int main(int argc, char *argv[]) {
+   /* ROS initialization */
+   ros::init(argc, argv, "obj_fusion");
+@@ -403,14 +325,16 @@ int main(int argc, char *argv[]) {
+   private_n.param("vmap_threshold", vmap_threshold, 5.0);
+   vmap_threshold *= vmap_threshold; // squared
+ 
+-  /* Initialize flags */
+-  isReady_obj_label = false;
+-  isReady_cluster_centroids = false;
++  typedef message_filters::sync_policies::ApproximateTime&lt;
++    autoware_msgs::obj_label, autoware_msgs::CloudClusterArray&gt; SyncPolicy;
++  message_filters::Subscriber&lt;autoware_msgs::obj_label&gt; obj_label_sub(
++    n, "obj_label", SUBSCRIBE_QUEUE_SIZE);
++  message_filters::Subscriber&lt;autoware_msgs::CloudClusterArray&gt; cluster_centroids_sub(
++    n, "/cloud_clusters", SUBSCRIBE_QUEUE_SIZE);
++  message_filters::Synchronizer&lt;SyncPolicy&gt; sync(
++    SyncPolicy(SUBSCRIBE_QUEUE_SIZE), obj_label_sub, cluster_centroids_sub);
++  sync.registerCallback(boost::bind(&amp;fusion_cb, _1, _2));
+ 
+-  ros::Subscriber obj_label_sub =
+-      n.subscribe("obj_label", SUBSCRIBE_QUEUE_SIZE, obj_label_cb);
+-  ros::Subscriber cluster_centroids_sub = n.subscribe(
+-      "/cloud_clusters", SUBSCRIBE_QUEUE_SIZE, cluster_centroids_cb);
+   obj_pose_pub = n.advertise&lt;jsk_recognition_msgs::BoundingBoxArray&gt;(
+       "obj_pose", ADVERTISE_QUEUE_SIZE, ADVERTISE_LATCH);
+   cluster_class_pub = n.advertise&lt;autoware_msgs::CloudClusterArray&gt;(
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="8d05bdaf8f345078fb3fb879a317fe2d919ebc4f" author="Akihito OHSATO">
+		<msg>Fix coodinate bug and small refactor</msg>
+		<modified_files>
+			<file old_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" new_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" added_lines="47" deleted_lines="45">
+				<diff>@@ -22,8 +22,8 @@ using vector_map::Node;
+ using vector_map::Point;
+ using vector_map::Key;
+ 
+-static constexpr uint32_t SUBSCRIBE_QUEUE_SIZE = 100;
+-static constexpr uint32_t ADVERTISE_QUEUE_SIZE = 10;
++static constexpr uint32_t SUBSCRIBE_QUEUE_SIZE = 1;
++static constexpr uint32_t ADVERTISE_QUEUE_SIZE = 1;
+ static constexpr bool ADVERTISE_LATCH = false;
+ static constexpr double LOOP_RATE = 15.0;
+ 
+@@ -152,7 +152,7 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+   autoware_msgs::CloudClusterArray cloud_clusters_msg;
+   cloud_clusters_msg.header = header;
+   visualization_msgs::MarkerArray marker_array_msg;
+-  int id = 0;
++  int marker_id = 0;
+ 
+   for (unsigned int i = 0; i &lt; obj_label.obj_id.size(); ++i) {
+     if (obj_indices.at(i) == -1) continue;
+@@ -171,13 +171,13 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+     bounding_box = v_cloud_cluster.at(obj_indices.at(i)).bounding_box;
+ 
+     /* adjust object rotation using lane in vector_map */
+-    tf::Quaternion q1(bounding_box.pose.orientation.x,
++    tf::Quaternion q_obj(bounding_box.pose.orientation.x,
+       bounding_box.pose.orientation.y,
+       bounding_box.pose.orientation.z,
+       bounding_box.pose.orientation.w);
+     bool fixed_rotation = false;
+     if (use_vmap) {
+-      int mi = 0; // number of rotaiton 90deg
++      int rot_n = 0; // yaw' = yaw + n*pi/2
+       vector_map_server::GetLane get_lane;
+       get_lane.request.pose.pose = bounding_box.pose;
+       tf::Vector3 orgpt(bounding_box.pose.position.x,
+@@ -202,25 +202,26 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+           double my = get_lane.request.pose.pose.position.y;
+           if ((mx-fp.ly)*(mx-fp.ly)+(my-fp.bx)*(my-fp.bx) &lt; vmap_threshold) {
+             fixed_rotation = true;
+-            tf::Quaternion ql;
+-            ql.setRPY(0, 0, atan2(fp.bx - bp.bx, fp.ly - bp.ly)); // y,x
+-            tf::Quaternion qb = tform * q1;
+-            tf::Quaternion qm;
+-            qm.setRPY(0, 0, M_PI/2);
+-            double mr = M_PI;
++            tf::Quaternion qm_lane;   // map-cood
++            qm_lane.setRPY(0, 0, atan2(fp.bx - bp.bx, fp.ly - bp.ly)); // y,x
++            tf::Quaternion q_step;  // 90 deg
++            q_step.setRPY(0, 0, M_PI/2);
++            double r_max = M_PI;
+             // search in 0,90,180,270-degree
++            tf::Quaternion qr_obj = q_obj; // rotated
+             for (int i = 0; i &lt; 4; i++) {
+-              double r = ql.angle(qb);
++              tf::Quaternion qrm_obj = tform * qr_obj;  // map-cood
++              double r = qm_lane.angle(qrm_obj);
+               r = (r &gt;= M_PI/2) ? (r - M_PI):r;
+-              if (fabs(r) &lt; mr) {
+-                mr = fabs(r);
+-                mi = i;
++              if (fabs(r) &lt; r_max) {
++                r_max = fabs(r);
++                rot_n = i;
+               }
+-              qb *= qm;
++              qr_obj *= q_step;
+             }
+             double roll, pitch, yaw;
+-            tf::Matrix3x3(q1).getRPY(roll, pitch, yaw);
+-            ROS_INFO(" %d roll=%f pitch=%f yaw=%f", mi*90, roll, pitch, yaw);
++            tf::Matrix3x3(q_obj).getRPY(roll, pitch, yaw);
++            ROS_INFO(" %d roll=%f pitch=%f yaw=%f", rot_n*90, roll, pitch, yaw);
+             break;
+           }
+         }
+@@ -228,24 +229,25 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+         ROS_INFO("%s: VectorMap Server call failed.", __FUNCTION__);
+       }
+       // determine rotation
+-      tf::Quaternion dq1;
+-      dq1.setRPY(0, 0, M_PI*mi/2);
+-      q1 *= dq1;
++      tf::Quaternion dq_obj;
++      dq_obj.setRPY(0, 0, M_PI*rot_n/2);
++      q_obj *= dq_obj;
+       // bounding_box
+-      bounding_box.pose.orientation.x = q1.x();
+-      bounding_box.pose.orientation.y = q1.y();
+-      bounding_box.pose.orientation.z = q1.z();
+-      bounding_box.pose.orientation.w = q1.w();
+-      if (mi % 2 == 1) { // swap x-y at 90,270 deg
++      bounding_box.pose.orientation.x = q_obj.x();
++      bounding_box.pose.orientation.y = q_obj.y();
++      bounding_box.pose.orientation.z = q_obj.z();
++      bounding_box.pose.orientation.w = q_obj.w();
++      if (rot_n % 2 == 1) { // swap x-y at 90,270 deg
+         std::swap(bounding_box.dimensions.x, bounding_box.dimensions.y);
+       }
++      // cloud clusters
+       v_cloud_cluster.at(obj_indices.at(i)).bounding_box = bounding_box;
+     }
+ 
+     // x-axis
+     visualization_msgs::Marker marker;
+     marker.header = header;
+-    marker.id = id++;
++    marker.id = marker_id++;
+     marker.lifetime = ros::Duration(0.1);
+     marker.type = visualization_msgs::Marker::ARROW;
+     marker.pose.position = bounding_box.pose.position;
+@@ -258,28 +260,28 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+     marker_array_msg.markers.push_back(marker);
+ 
+     // y-axis
+-    tf::Quaternion q2;
+-    q2.setRPY(0, 0, M_PI/2);
+-    q1 *= q2;
+-    marker.id = id++;
+-    marker.pose.orientation.x = q1.x();
+-    marker.pose.orientation.y = q1.y();
+-    marker.pose.orientation.z = q1.z();
+-    marker.pose.orientation.w = q1.w();
++    tf::Quaternion qy;
++    qy.setRPY(0, 0, M_PI/2);
++    q_obj *= qy;
++    marker.id = marker_id++;
++    marker.pose.orientation.x = q_obj.x();
++    marker.pose.orientation.y = q_obj.y();
++    marker.pose.orientation.z = q_obj.z();
++    marker.pose.orientation.w = q_obj.w();
+     marker.color.r = 0.0;
+     marker.color.g = 1.0;
+     marker.color.a = 1.0;
+     marker_array_msg.markers.push_back(marker);
+ 
+     // z-axis
+-    tf::Quaternion q3;
+-    q3.setRPY(0, -M_PI/2, 0);
+-    q1 *= q3;
+-    marker.id = id++;
+-    marker.pose.orientation.x = q1.x();
+-    marker.pose.orientation.y = q1.y();
+-    marker.pose.orientation.z = q1.z();
+-    marker.pose.orientation.w = q1.w();
++    tf::Quaternion qz;
++    qz.setRPY(0, -M_PI/2, 0);
++    q_obj *= qz;
++    marker.id = marker_id++;
++    marker.pose.orientation.x = q_obj.x();
++    marker.pose.orientation.y = q_obj.y();
++    marker.pose.orientation.z = q_obj.z();
++    marker.pose.orientation.w = q_obj.w();
+     marker.color.g = 0.0;
+     marker.color.b = 1.0;
+     marker.color.a = 1.0;
+@@ -287,14 +289,14 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+ 
+     // rotated by lane
+     if (fixed_rotation) {
+-      marker.id = id++;
++      marker.id = marker_id++;
+       marker.type = visualization_msgs::Marker::SPHERE;
+       marker.scale.x = 1.0;
+       marker.scale.y = 1.0;
+       marker.scale.z = 1.0;
++      marker.color.r = 1.0;
+       marker.color.g = 1.0;
+       marker.color.b = 1.0;
+-      marker.color.a = 1.0;
+       marker_array_msg.markers.push_back(marker);
+     }
+ 
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="2f215effe591e992383f02745da8f8b3e7ea1d6c" author="huiyi1990">
+		<msg>revise bugs in planninghelpers.cpp</msg>
+		<modified_files>
+			<file old_path="ros\src\computing\planning\common\lib\openplanner\op_planner\src\PlanningHelpers.cpp" new_path="ros\src\computing\planning\common\lib\openplanner\op_planner\src\PlanningHelpers.cpp" added_lines="1" deleted_lines="1">
+				<diff>@@ -1391,7 +1391,7 @@ WayPoint* PlanningHelpers::BuildPlanningSearchTreeV2(WayPoint* pStart,
+ 
+ 				wp-&gt;cost = pH-&gt;cost + d;
+ 				wp-&gt;pRight = pH;
+-				wp-&gt;pRight = 0;
++				wp-&gt;pLeft = 0;
+ 
+ 				nextLeafToTrace.push_back(make_pair(pH, wp));
+ 				all_cells_to_delete.push_back(wp);
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="f0027fde49313a7a6a53ceb3a0a99cbd5472ed84" author="Dejan Pangercic">
+		<msg>link to documentation</msg>
+		<modified_files>
+			<file old_path="ros\src\sensing\filters\packages\points_preprocessor\nodes\ground_filter\ground_filter.cpp" new_path="ros\src\sensing\filters\packages\points_preprocessor\nodes\ground_filter\ground_filter.cpp" added_lines="2" deleted_lines="1">
+				<diff>@@ -2,7 +2,8 @@
+  * ground_filter.cpp
+  *
+  * Created on	: May 19, 2017
+- * Author	: Patiphon Narksri					
++ * Author	: Patiphon Narksri
++ * @brief Below algorithm is documented here https://github.com/CPFL/Autoware-Manuals/tree/master/en/pdfs/ground_filter.pdf.
+  */
+ #include &lt;ros/ros.h&gt;
+ #include &lt;sensor_msgs/PointCloud2.h&gt;
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="615a91941f68551aa4da2b07aac8705732afea38" author="Akihito OHSATO">
+		<msg>Refactored by pullreq feedbacks and roscpp-code-format</msg>
+		<modified_files>
+			<file old_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" new_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" added_lines="102" deleted_lines="90">
+				<diff>@@ -44,30 +44,33 @@ static ros::ServiceClient vmap_server;
+ static bool use_vmap;
+ static double vmap_threshold;
+ 
+-struct obj_label_t {
++struct obj_label_t
++{
+   std::vector&lt;geometry_msgs::Point&gt; reprojected_positions;
+   std::vector&lt;int&gt; obj_id;
+ };
+ obj_label_t obj_label;
+ 
+-static double euclid_distance(const geometry_msgs::Point pos1,
+-                              const geometry_msgs::Point pos2) {
+-  return sqrt(pow(pos1.x - pos2.x, 2) + pow(pos1.y - pos2.y, 2) +
+-              pow(pos1.z - pos2.z, 2));
++static double euclid_distance(const geometry_msgs::Point pos1, const geometry_msgs::Point pos2)
++{
++  return sqrt(pow(pos1.x - pos2.x, 2) + pow(pos1.y - pos2.y, 2) + pow(pos1.z - pos2.z, 2));
+ 
+ } /* static double distance() */
+ 
+ /* fusion reprojected position and pointcloud centroids */
+ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+-  const autoware_msgs::CloudClusterArray::ConstPtr &amp;in_cloud_cluster_array_ptr) {
+-
++               const autoware_msgs::CloudClusterArray::ConstPtr &amp;in_cloud_cluster_array_ptr)
++{
+   tf::StampedTransform tform;
+   tf::TransformListener tflistener;
+-  try {
+-    ros::Time now = ros::Time(0);
+-    tflistener.waitForTransform("/map", "/velodyne", now, ros::Duration(10));
+-    tflistener.lookupTransform("/map", "/velodyne", now, tform);
+-  } catch (tf::TransformException ex) {
++  try
++  {
++    ros::Time latest_time = ros::Time(0);
++    tflistener.waitForTransform("/map", "/velodyne", latest_time, ros::Duration(10));
++    tflistener.lookupTransform("/map", "/velodyne", latest_time, tform);
++  }
++  catch (tf::TransformException ex)
++  {
+     ROS_INFO("%s: %s", __FUNCTION__, ex.what());
+     return;
+   }
+@@ -76,9 +79,9 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+   object_type = obj_label_msg-&gt;type;
+   obj_pose_timestamp = obj_label_msg-&gt;header.stamp;
+ 
+-  for (unsigned int i = 0; i &lt; obj_label_msg-&gt;obj_id.size(); ++i) {
+-    obj_label.reprojected_positions.push_back(
+-        obj_label_msg-&gt;reprojected_pos.at(i));
++  for (unsigned int i = 0; i &lt; obj_label_msg-&gt;obj_id.size(); ++i)
++  {
++    obj_label.reprojected_positions.push_back(obj_label_msg-&gt;reprojected_pos.at(i));
+     obj_label.obj_id.push_back(obj_label_msg-&gt;obj_id.at(i));
+   }
+ 
+@@ -86,12 +89,11 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+   std_msgs::Header header = sensor_header;
+   std::vector&lt;geometry_msgs::Point&gt; centroids;
+ 
+-  for (int i(0); i &lt; (int)in_cloud_cluster_array_ptr-&gt;clusters.size(); ++i) {
+-    autoware_msgs::CloudCluster cloud_cluster =
+-        in_cloud_cluster_array_ptr-&gt;clusters.at(i);
++  for (int i(0); i &lt; (int)in_cloud_cluster_array_ptr-&gt;clusters.size(); ++i)
++  {
++    autoware_msgs::CloudCluster cloud_cluster = in_cloud_cluster_array_ptr-&gt;clusters.at(i);
+     /* convert centroids coodinate from velodyne frame to map frame */
+-    tf::Vector3 pt(cloud_cluster.centroid_point.point.x,
+-                   cloud_cluster.centroid_point.point.y,
++    tf::Vector3 pt(cloud_cluster.centroid_point.point.x, cloud_cluster.centroid_point.point.y,
+                    cloud_cluster.centroid_point.point.z);
+     tf::Vector3 converted = tform * pt;
+     sensor_header = cloud_cluster.header;
+@@ -104,9 +106,8 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+     centroids.push_back(point_in_map);
+   }
+ 
+-  if (centroids.empty() ||
+-      obj_label.reprojected_positions.empty() ||
+-      obj_label.obj_id.empty()) {
++  if (centroids.empty() || obj_label.reprojected_positions.empty() || obj_label.obj_id.empty())
++  {
+     jsk_recognition_msgs::BoundingBoxArray pub_msg;
+     pub_msg.header = header;
+     std_msgs::Time time;
+@@ -122,26 +123,30 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+   }
+ 
+   std::vector&lt;int&gt; obj_indices;
+-  for (unsigned int i = 0; i &lt; obj_label.obj_id.size(); ++i) {
++  for (unsigned int i = 0; i &lt; obj_label.obj_id.size(); ++i)
++  {
+     unsigned int min_idx = 0;
+     double min_distance = DBL_MAX;
+ 
+     /* calculate each euclid distance between reprojected position and centroids
+      */
+-    for (unsigned int j = 0; j &lt; centroids.size(); j++) {
+-      double distance =
+-          euclid_distance(obj_label.reprojected_positions.at(i),
+-                          centroids.at(j));
++    for (unsigned int j = 0; j &lt; centroids.size(); ++j)
++    {
++      double distance = euclid_distance(obj_label.reprojected_positions.at(i), centroids.at(j));
+ 
+       /* Nearest centroid correspond to this reprojected object */
+-      if (distance &lt; min_distance) {
++      if (distance &lt; min_distance)
++      {
+         min_distance = distance;
+         min_idx = j;
+       }
+     }
+-    if (min_distance &lt; threshold_min_dist) {
++    if (min_distance &lt; threshold_min_dist)
++    {
+       obj_indices.push_back(min_idx);
+-    } else {
++    }
++    else
++    {
+       obj_indices.push_back(-1);
+     }
+   }
+@@ -154,15 +159,24 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+   visualization_msgs::MarkerArray marker_array_msg;
+   int marker_id = 0;
+ 
+-  for (unsigned int i = 0; i &lt; obj_label.obj_id.size(); ++i) {
+-    if (obj_indices.at(i) == -1) continue;
++  for (unsigned int i = 0; i &lt; obj_label.obj_id.size(); ++i)
++  {
++    if (obj_indices.at(i) == -1)
++    {
++      continue;
++    }
+ 
+     v_cloud_cluster.at(obj_indices.at(i)).label = object_type;
+-    if (object_type == "car") {
++    if (object_type == "car")
++    {
+       v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = 0;
+-    } else if (object_type == "person") {
++    }
++    else if (object_type == "person")
++    {
+       v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = 1;
+-    } else {
++    }
++    else
++    {
+       v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = 2;
+       v_cloud_cluster.at(obj_indices.at(i)).label = "unknown";
+     }
+@@ -171,28 +185,25 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+     bounding_box = v_cloud_cluster.at(obj_indices.at(i)).bounding_box;
+ 
+     /* adjust object rotation using lane in vector_map */
+-    tf::Quaternion q_obj(bounding_box.pose.orientation.x,
+-      bounding_box.pose.orientation.y,
+-      bounding_box.pose.orientation.z,
+-      bounding_box.pose.orientation.w);
++    tf::Quaternion q_obj(bounding_box.pose.orientation.x, bounding_box.pose.orientation.y,
++                         bounding_box.pose.orientation.z, bounding_box.pose.orientation.w);
+     bool fixed_rotation = false;
+-    if (use_vmap) {
+-      int rot_n = 0; // yaw' = yaw + n*pi/2
++    if (use_vmap)
++    {
++      int rot_n = 0;  // yaw' = yaw + n*pi/2
+       vector_map_server::GetLane get_lane;
+       get_lane.request.pose.pose = bounding_box.pose;
+-      tf::Vector3 orgpt(bounding_box.pose.position.x,
+-        bounding_box.pose.position.y,
+-        bounding_box.pose.position.z);
++      tf::Vector3 orgpt(bounding_box.pose.position.x, bounding_box.pose.position.y, bounding_box.pose.position.z);
+       tf::Vector3 convpt = tform * orgpt;
+       get_lane.request.pose.pose.position.x = convpt.x();
+       get_lane.request.pose.pose.position.y = convpt.y();
+       get_lane.request.pose.pose.position.z = convpt.z();
+-      ROS_INFO("pos x=%f y=%f z=%f",
+-        get_lane.request.pose.pose.position.x,
+-        get_lane.request.pose.pose.position.y,
+-        get_lane.request.pose.pose.position.z);
+-      if (vmap_server.call(get_lane)) {
+-        for (const auto&amp; lane : get_lane.response.objects.data) {
++      ROS_INFO("pos x=%f y=%f z=%f", get_lane.request.pose.pose.position.x, get_lane.request.pose.pose.position.y,
++               get_lane.request.pose.pose.position.z);
++      if (vmap_server.call(get_lane))
++      {
++        for (const auto &amp;lane : get_lane.response.objects.data)
++        {
+           Node bn = vmap.findByKey(Key&lt;Node&gt;(lane.bnid));
+           Point bp = vmap.findByKey(Key&lt;Point&gt;(bn.pid));
+           Node fn = vmap.findByKey(Key&lt;Node&gt;(lane.fnid));
+@@ -200,20 +211,23 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+           ROS_INFO(" lane bn=(%f,%f) fn=(%f,%f)", bp.ly, bp.bx, fp.ly, fp.bx);
+           double mx = get_lane.request.pose.pose.position.x;
+           double my = get_lane.request.pose.pose.position.y;
+-          if ((mx-fp.ly)*(mx-fp.ly)+(my-fp.bx)*(my-fp.bx) &lt; vmap_threshold) {
++          if ((mx - fp.ly) * (mx - fp.ly) + (my - fp.bx) * (my - fp.bx) &lt; vmap_threshold)
++          {
+             fixed_rotation = true;
+-            tf::Quaternion qm_lane;   // map-cood
+-            qm_lane.setRPY(0, 0, atan2(fp.bx - bp.bx, fp.ly - bp.ly)); // y,x
+-            tf::Quaternion q_step;  // 90 deg
+-            q_step.setRPY(0, 0, M_PI/2);
++            tf::Quaternion qm_lane;                                     // map-cood
++            qm_lane.setRPY(0, 0, atan2(fp.bx - bp.bx, fp.ly - bp.ly));  // y,x
++            tf::Quaternion q_step;                                      // 90 deg
++            q_step.setRPY(0, 0, M_PI / 2);
+             double r_max = M_PI;
+             // search in 0,90,180,270-degree
+-            tf::Quaternion qr_obj = q_obj; // rotated
+-            for (int i = 0; i &lt; 4; i++) {
++            tf::Quaternion qr_obj = q_obj;  // rotated
++            for (int i = 0; i &lt; 4; ++i)
++            {
+               tf::Quaternion qrm_obj = tform * qr_obj;  // map-cood
+               double r = qm_lane.angle(qrm_obj);
+-              r = (r &gt;= M_PI/2) ? (r - M_PI):r;
+-              if (fabs(r) &lt; r_max) {
++              r = (r &gt;= M_PI / 2) ? (r - M_PI) : r;
++              if (fabs(r) &lt; r_max)
++              {
+                 r_max = fabs(r);
+                 rot_n = i;
+               }
+@@ -221,23 +235,26 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+             }
+             double roll, pitch, yaw;
+             tf::Matrix3x3(q_obj).getRPY(roll, pitch, yaw);
+-            ROS_INFO(" %d roll=%f pitch=%f yaw=%f", rot_n*90, roll, pitch, yaw);
++            ROS_INFO(" %d roll=%f pitch=%f yaw=%f", rot_n * 90, roll, pitch, yaw);
+             break;
+           }
+         }
+-      } else {
++      }
++      else
++      {
+         ROS_INFO("%s: VectorMap Server call failed.", __FUNCTION__);
+       }
+       // determine rotation
+       tf::Quaternion dq_obj;
+-      dq_obj.setRPY(0, 0, M_PI*rot_n/2);
++      dq_obj.setRPY(0, 0, M_PI * rot_n / 2);
+       q_obj *= dq_obj;
+       // bounding_box
+       bounding_box.pose.orientation.x = q_obj.x();
+       bounding_box.pose.orientation.y = q_obj.y();
+       bounding_box.pose.orientation.z = q_obj.z();
+       bounding_box.pose.orientation.w = q_obj.w();
+-      if (rot_n % 2 == 1) { // swap x-y at 90,270 deg
++      if (rot_n % 2 == 1) // swap x-y at 90,270 deg
++      {
+         std::swap(bounding_box.dimensions.x, bounding_box.dimensions.y);
+       }
+       // cloud clusters
+@@ -261,7 +278,7 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+ 
+     // y-axis
+     tf::Quaternion qy;
+-    qy.setRPY(0, 0, M_PI/2);
++    qy.setRPY(0, 0, M_PI / 2);
+     q_obj *= qy;
+     marker.id = marker_id++;
+     marker.pose.orientation.x = q_obj.x();
+@@ -275,7 +292,7 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+ 
+     // z-axis
+     tf::Quaternion qz;
+-    qz.setRPY(0, -M_PI/2, 0);
++    qz.setRPY(0, -M_PI / 2, 0);
+     q_obj *= qz;
+     marker.id = marker_id++;
+     marker.pose.orientation.x = q_obj.x();
+@@ -288,7 +305,8 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+     marker_array_msg.markers.push_back(marker);
+ 
+     // rotated by lane
+-    if (fixed_rotation) {
++    if (fixed_rotation)
++    {
+       marker.id = marker_id++;
+       marker.type = visualization_msgs::Marker::SPHERE;
+       marker.scale.x = 1.0;
+@@ -300,11 +318,9 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+       marker_array_msg.markers.push_back(marker);
+     }
+ 
+-    v_cloud_cluster.at(obj_indices.at(i)).bounding_box.value
+-      = obj_label.obj_id.at(i);
++    v_cloud_cluster.at(obj_indices.at(i)).bounding_box.value = obj_label.obj_id.at(i);
+     pub_msg.boxes.push_back(bounding_box);
+-    cloud_clusters_msg.clusters.push_back(
+-      v_cloud_cluster.at(obj_indices.at(i)));
++    cloud_clusters_msg.clusters.push_back(v_cloud_cluster.at(obj_indices.at(i)));
+   }
+ 
+   marker_array_pub.publish(marker_array_msg);
+@@ -315,7 +331,8 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+   obj_pose_timestamp_pub.publish(time);
+ }
+ 
+-int main(int argc, char *argv[]) {
++int main(int argc, char *argv[])
++{
+   /* ROS initialization */
+   ros::init(argc, argv, "obj_fusion");
+ 
+@@ -325,28 +342,23 @@ int main(int argc, char *argv[]) {
+   private_n.param("min_dist", threshold_min_dist, 2.0);
+   private_n.param("use_vmap", use_vmap, true);
+   private_n.param("vmap_threshold", vmap_threshold, 5.0);
+-  vmap_threshold *= vmap_threshold; // squared
+-
+-  typedef message_filters::sync_policies::ApproximateTime&lt;
+-    autoware_msgs::obj_label, autoware_msgs::CloudClusterArray&gt; SyncPolicy;
+-  message_filters::Subscriber&lt;autoware_msgs::obj_label&gt; obj_label_sub(
+-    n, "obj_label", SUBSCRIBE_QUEUE_SIZE);
+-  message_filters::Subscriber&lt;autoware_msgs::CloudClusterArray&gt; cluster_centroids_sub(
+-    n, "/cloud_clusters", SUBSCRIBE_QUEUE_SIZE);
+-  message_filters::Synchronizer&lt;SyncPolicy&gt; sync(
+-    SyncPolicy(SUBSCRIBE_QUEUE_SIZE), obj_label_sub, cluster_centroids_sub);
++  vmap_threshold *= vmap_threshold;  // squared
++
++  typedef message_filters::sync_policies::ApproximateTime&lt;autoware_msgs::obj_label, autoware_msgs::CloudClusterArray&gt;
++      SyncPolicy;
++  message_filters::Subscriber&lt;autoware_msgs::obj_label&gt; obj_label_sub(n, "obj_label", SUBSCRIBE_QUEUE_SIZE);
++  message_filters::Subscriber&lt;autoware_msgs::CloudClusterArray&gt; cluster_centroids_sub(n, "/cloud_clusters",
++                                                                                      SUBSCRIBE_QUEUE_SIZE);
++  message_filters::Synchronizer&lt;SyncPolicy&gt; sync(SyncPolicy(SUBSCRIBE_QUEUE_SIZE), obj_label_sub,
++                                                 cluster_centroids_sub);
+   sync.registerCallback(boost::bind(&amp;fusion_cb, _1, _2));
+ 
+-  obj_pose_pub = n.advertise&lt;jsk_recognition_msgs::BoundingBoxArray&gt;(
+-      "obj_pose", ADVERTISE_QUEUE_SIZE, ADVERTISE_LATCH);
+-  cluster_class_pub = n.advertise&lt;autoware_msgs::CloudClusterArray&gt;(
+-      "/cloud_clusters_class", ADVERTISE_QUEUE_SIZE);
+-  obj_pose_timestamp_pub =
+-      n.advertise&lt;std_msgs::Time&gt;("obj_pose_timestamp", ADVERTISE_QUEUE_SIZE);
++  obj_pose_pub = n.advertise&lt;jsk_recognition_msgs::BoundingBoxArray&gt;("obj_pose", ADVERTISE_QUEUE_SIZE, ADVERTISE_LATCH);
++  cluster_class_pub = n.advertise&lt;autoware_msgs::CloudClusterArray&gt;("/cloud_clusters_class", ADVERTISE_QUEUE_SIZE);
++  obj_pose_timestamp_pub = n.advertise&lt;std_msgs::Time&gt;("obj_pose_timestamp", ADVERTISE_QUEUE_SIZE);
+   marker_array_pub = n.advertise&lt;visualization_msgs::MarkerArray&gt;("obj_pose_arrow", 1, true);
+   vmap_server = n.serviceClient&lt;vector_map_server::GetLane&gt;("/vector_map_server/get_lane");
+-  vmap.subscribe(n, vector_map::Category::POINT | vector_map::Category::NODE,
+-                 ros::Duration(0)); // non-blocking
++  vmap.subscribe(n, vector_map::Category::POINT | vector_map::Category::NODE, ros::Duration(0));  // non-blocking
+ 
+   ros::spin();
+ 
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+	<commit hash="9025d133cf2c6fd4b4f57aaca21030a67d9917be" author="Akihito OHSATO">
+		<msg>Add an enum type for object labels</msg>
+		<modified_files>
+			<file old_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" new_path="ros\src\computing\perception\detection\packages\lidar_tracker\nodes\obj_fusion\obj_fusion.cpp" added_lines="10" deleted_lines="3">
+				<diff>@@ -51,6 +51,13 @@ struct obj_label_t
+ };
+ obj_label_t obj_label;
+ 
++enum ObjLabel
++{
++  Car,
++  Person,
++  Unknown
++};
++
+ static double euclid_distance(const geometry_msgs::Point pos1, const geometry_msgs::Point pos2)
+ {
+   return sqrt(pow(pos1.x - pos2.x, 2) + pow(pos1.y - pos2.y, 2) + pow(pos1.z - pos2.z, 2));
+@@ -169,15 +176,15 @@ void fusion_cb(const autoware_msgs::obj_label::ConstPtr &amp;obj_label_msg,
+     v_cloud_cluster.at(obj_indices.at(i)).label = object_type;
+     if (object_type == "car")
+     {
+-      v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = 0;
++      v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = Car;
+     }
+     else if (object_type == "person")
+     {
+-      v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = 1;
++      v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = Person;
+     }
+     else
+     {
+-      v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = 2;
++      v_cloud_cluster.at(obj_indices.at(i)).bounding_box.label = Unknown;
+       v_cloud_cluster.at(obj_indices.at(i)).label = "unknown";
+     }
+ 
+</diff>
+			</file>
+		</modified_files>
+	</commit>
+</Root>
